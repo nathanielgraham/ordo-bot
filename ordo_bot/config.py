@@ -5,9 +5,6 @@ We use pydantic-settings so configuration can come from:
   - a TOML file (config.toml)
   - environment variables
   - defaults defined in this file
-
-This keeps secrets (API keys) out of the code and makes it easy
-for users to change settings without editing Python.
 """
 
 from pathlib import Path
@@ -18,18 +15,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """
-    Main settings class.
-
-    All fields have sensible defaults so the bot can start
-    even with a minimal config file.
-    """
+    """Main settings class."""
 
     model_config = SettingsConfigDict(
-        env_prefix="ORDO_BOT_",          # environment variables start with ORDO_BOT_
-        env_file=".env",                 # also load from a .env file if present
+        env_prefix="ORDO_BOT_",
+        env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",                  # ignore unknown fields instead of crashing
+        extra="ignore",
     )
 
     # ------------------------------------------------------------------
@@ -48,11 +40,11 @@ class Settings(BaseSettings):
     # LLM (OpenAI-compatible)
     # ------------------------------------------------------------------
     llm_base_url: str = Field(
-        default="http://localhost:11434/v1",  # default = local Ollama
+        default="http://localhost:11434/v1",
         description="Base URL of the OpenAI-compatible API",
     )
     llm_api_key: str = Field(
-        default="ollama",                     # Ollama ignores the key, but some clients require one
+        default="ollama",
         description="API key for the LLM provider",
     )
     llm_model: str = Field(
@@ -61,7 +53,26 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # Frontend WebSocket server (the API that CLI / web UI connect to)
+    # Agent context hygiene
+    # ------------------------------------------------------------------
+    # Max non-system messages kept in history. 0 = unlimited (large-context models).
+    max_history_messages: int = Field(
+        default=24,
+        description="Max non-system messages in agent history (0 = unlimited)",
+    )
+    # Max characters of a single tool result stored for the LLM.
+    tool_result_max_chars: int = Field(
+        default=2500,
+        description="Max chars per tool result in LLM context",
+    )
+    # Fetch get_documentation summary once after Ordo login.
+    bootstrap_docs: bool = Field(
+        default=True,
+        description="Load a short Ordo docs summary into context after login",
+    )
+
+    # ------------------------------------------------------------------
+    # Frontend WebSocket server
     # ------------------------------------------------------------------
     frontend_host: str = Field(
         default="127.0.0.1",
@@ -82,15 +93,9 @@ class Settings(BaseSettings):
 
 
 def load_settings(config_path: Optional[Path] = None) -> Settings:
-    """
-    Load settings, optionally from a TOML file.
-
-    If a config_path is given and the file exists, we read it.
-    Environment variables and defaults still apply on top.
-    """
+    """Load settings, optionally from a TOML file."""
     if config_path and config_path.exists():
-        # pydantic-settings can load TOML via model_validate
-        import tomllib  # Python 3.11+ standard library
+        import tomllib
 
         with open(config_path, "rb") as f:
             data = tomllib.load(f)

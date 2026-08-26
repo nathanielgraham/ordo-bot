@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Simple reference CLI client for ordo-bot.
-
-Connects to the bot's frontend WebSocket and lets you chat.
-
-Usage (bot must already be running):
+Reference CLI client for ordo-bot.
 
     python clients/cli.py
-    python clients/cli.py --url ws://127.0.0.1:8765
-    python clients/cli.py --verbose          # one-line Ordo event summaries
+    python clients/cli.py --verbose
+
+Commands:
+  quit / exit  — leave
+  reset        — clear agent conversation history
 """
 
 from __future__ import annotations
@@ -19,11 +18,10 @@ import json
 import sys
 from typing import Any, Dict, List
 
-# Enable up/down arrow command history for input() (Unix / macOS)
 try:
     import readline  # noqa: F401
 except ImportError:
-    pass  # Windows without pyreadline — arrows won't work, input still fine
+    pass
 
 try:
     import websockets
@@ -33,23 +31,13 @@ except ImportError:
 
 
 def summarize_ordo_event(data: Dict[str, Any]) -> str:
-    """
-    Turn a full ordo_event payload into one short line.
-
-    Examples:
-      [ordo] jobs_changed: panthero-stats → complete
-      [ordo] clusters_changed: Monitoring → running
-      [ordo] servers_changed: panthero
-    """
     event = data.get("event") or "?"
     payload = data.get("data") or {}
-
-    # Prefer the nested broadcast payload if present
     updates: List[dict] = payload.get("updates") or []
     names: List[str] = []
     states: List[str] = []
 
-    for u in updates[:3]:  # at most a few names
+    for u in updates[:3]:
         name = u.get("name")
         state = u.get("jobstate")
         if name:
@@ -69,9 +57,7 @@ def summarize_ordo_event(data: Dict[str, Any]) -> str:
 
 async def run(url: str, verbose: bool = False) -> None:
     print(f"Connecting to {url} ...")
-    # Long ping timeout so a slow agent reply does not drop us
     async with websockets.connect(url, ping_interval=30, ping_timeout=120) as ws:
-        # First message should be a status
         raw = await ws.recv()
         try:
             status = json.loads(raw)
@@ -82,7 +68,7 @@ async def run(url: str, verbose: bool = False) -> None:
         except Exception:
             print(f"Connected. (first message: {raw})")
 
-        print("Type a message and press Enter. 'quit' to exit.\n")
+        print("Type a message and press Enter. 'quit' to exit, 'reset' to clear history.\n")
 
         loop = asyncio.get_running_loop()
 
@@ -99,10 +85,11 @@ async def run(url: str, verbose: bool = False) -> None:
             if user_text.lower() in {"quit", "exit"}:
                 break
 
-            # Send chat message
-            await ws.send(json.dumps({"type": "chat", "content": user_text}))
+            if user_text.lower() in {"reset", "/reset"}:
+                await ws.send(json.dumps({"type": "reset"}))
+            else:
+                await ws.send(json.dumps({"type": "chat", "content": user_text}))
 
-            # Wait for reply (message or error). Ordo events may arrive in between.
             while True:
                 raw = await ws.recv()
                 try:
@@ -121,13 +108,11 @@ async def run(url: str, verbose: bool = False) -> None:
                     print()
                     break
                 if msg_type == "ordo_event":
-                    # Quiet by default; one-line summary with --verbose
                     if verbose:
                         print(summarize_ordo_event(data))
                     continue
                 if msg_type == "status":
                     continue
-                # Unknown – only show when verbose
                 if verbose:
                     print(f"[recv] {data}")
 
@@ -137,13 +122,13 @@ def main() -> None:
     p.add_argument(
         "--url",
         default="ws://127.0.0.1:8765",
-        help="Frontend WebSocket URL (default: ws://127.0.0.1:8765)",
+        help="Frontend WebSocket URL",
     )
     p.add_argument(
         "--verbose",
         "-v",
         action="store_true",
-        help="Show one-line summaries of Ordo events (jobs_changed, etc.)",
+        help="Show one-line summaries of Ordo events",
     )
     args = p.parse_args()
     try:
@@ -155,7 +140,6 @@ def main() -> None:
         )
         sys.exit(1)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        # Ctrl-C at the prompt — quiet exit, no traceback
         print()
         sys.exit(0)
 

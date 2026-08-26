@@ -1,22 +1,9 @@
 """
 Frontend WebSocket server.
 
-This is the API that external clients (CLI, web UI, etc.) connect to.
-They talk to ordo-bot; ordo-bot talks to Ordo and to the LLM.
+Clients talk to ordo-bot; ordo-bot talks to Ordo and the LLM.
 
-Protocol: NDJSON (one JSON object per line), defined in protocol.py.
-
-Client → bot:
-  {"type": "chat", "content": "hello"}
-  {"type": "ping"}
-
-Bot → client:
-  {"type": "message", "role": "assistant", "content": "..."}
-  {"type": "message_delta", "content": "..."}   (streaming, later)
-  {"type": "status", "ordo_connected": true, "model": "llama3.2"}
-  {"type": "ordo_event", "event": "jobs_changed", "data": {...}}
-  {"type": "error", "message": "..."}
-  {"type": "pong"}
+Ordo broadcasts are forwarded here only — they never enter agent history.
 """
 
 from __future__ import annotations
@@ -24,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Set
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -43,15 +30,7 @@ log = logging.getLogger("ordo_bot.frontend")
 
 
 class FrontendServer:
-    """
-    Async WebSocket server for front-end clients.
-
-    Usage:
-        server = FrontendServer(host, port, agent, ordo_connected=True, model="llama3.2")
-        await server.start()
-        ...
-        await server.stop()
-    """
+    """Async WebSocket server for front-end clients."""
 
     def __init__(
         self,
@@ -70,17 +49,9 @@ class FrontendServer:
 
         self._server: Any = None
         self._clients: Set[WebSocketServerProtocol] = set()
-        # Only one chat at a time for v1 (simple and safe)
         self._chat_lock = asyncio.Lock()
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     async def start(self) -> None:
-        """Bind and start accepting connections."""
-        # Long timeouts: agent+tools can take a while; we must still
-        # answer WebSocket pings so the CLI does not disconnect.
         self._server = await websockets.serve(
             self._handle_client,
             self.host,
@@ -91,7 +62,6 @@ class FrontendServer:
         log.info("Frontend WebSocket listening on ws://%s:%s", self.host, self.port)
 
     async def stop(self) -> None:
-        """Close the server and all client connections."""
         if self._server is None:
             return
         self._server.close()
@@ -100,17 +70,12 @@ class FrontendServer:
         self._clients.clear()
         log.info("Frontend WebSocket stopped")
 
-    # ------------------------------------------------------------------
-    # Broadcast helpers (used by the main bot when Ordo events arrive)
-    # ------------------------------------------------------------------
-
     async def broadcast_ordo_event(self, event: str, data: Dict[str, Any]) -> None:
-        """Send an Ordo event to every connected client."""
+        """UI-only: never written into agent.messages."""
         msg = OrdoEventMessage(event=event, data=data)
         await self._broadcast(msg.model_dump())
 
     async def broadcast_status(self) -> None:
-        """Push current status to every client."""
         msg = StatusMessage(
             ordo_connected=self.ordo_connected,
             model=self.model,
@@ -130,19 +95,11 @@ class FrontendServer:
         for ws in dead:
             self._clients.discard(ws)
 
-    # ------------------------------------------------------------------
-    # Per-client handler
-    # ------------------------------------------------------------------
-
     async def _handle_client(self, ws: WebSocketServerProtocol) -> None:
-        """
-        One connection from a front-end client.
-        """
         peer = getattr(ws, "remote_address", None)
         log.info("Client connected: %s", peer)
         self._clients.add(ws)
 
-        # Send initial status so the client knows we are alive
         status = StatusMessage(
             ordo_connected=self.ordo_connected,
             model=self.model,
@@ -152,8 +109,6 @@ class FrontendServer:
         pending: Set[asyncio.Task] = set()
         try:
             async for raw in ws:
-                # Run handlers as tasks so the connection can still
-                # process WebSocket pings while the agent is thinking.
                 task = asyncio.create_task(self._handle_message(ws, raw))
                 pending.add(task)
                 task.add_done_callback(pending.discard)
@@ -168,9 +123,6 @@ class FrontendServer:
             log.info("Client disconnected: %s", peer)
 
     async def _handle_message(self, ws: WebSocketServerProtocol, raw: str) -> None:
-        """
-        Parse one client message and act on it.
-        """
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
@@ -189,15 +141,17 @@ class FrontendServer:
             await ws.send(json.dumps(PongMessage().model_dump()))
             return
 
+        if msg.type == "reset":
+            self.agent.reset()
+            out = AssistantMessage(content="Conversation history cleared.")
+            await ws.send(json.dumps(out.model_dump()))
+            return
+
         if msg.type == "chat":
             await self._handle_chat(ws, msg.content)
             return
 
     async def _handle_chat(self, ws: WebSocketServerProtocol, content: str) -> None:
-        """
-        Run the agent and send the full reply back.
-        (Streaming deltas can be added later.)
-        """
         async with self._chat_lock:
             try:
                 reply = await self.agent.handle_chat(content)
