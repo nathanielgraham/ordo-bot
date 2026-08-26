@@ -4,13 +4,17 @@ LLM wrapper for ordo-bot.
 Talks to any OpenAI-compatible endpoint (Ollama, Groq, OpenRouter, xAI, …)
 using the official `openai` Python SDK.
 
-Includes request timeout and light retries for transient provider errors.
+Includes request timeout, light retries, and recovery for Groq tool_use_failed
+(where the model *did* produce a tool call but the API rejected the frame).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -18,7 +22,6 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 
 log = logging.getLogger("ordo_bot.llm")
 
-# Default: fail a single completion rather than hang forever
 DEFAULT_LLM_TIMEOUT_SEC = 90.0
 DEFAULT_LLM_RETRIES = 2
 DEFAULT_LLM_RETRY_BACKOFF_SEC = 1.5
@@ -26,7 +29,6 @@ DEFAULT_LLM_RETRY_BACKOFF_SEC = 1.5
 
 @dataclass
 class ToolCall:
-    """One function call requested by the model."""
     id: str
     name: str
     arguments: str  # JSON string from the model
@@ -34,38 +36,120 @@ class ToolCall:
 
 @dataclass
 class ChatResult:
-    """
-    Result of a chat completion.
-
-    content    – assistant text (may be empty if the model only wants tools)
-    tool_calls – list of tools the model wants to run (may be empty)
-    """
     content: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
 
 
+def _error_body(exc: BaseException) -> Dict[str, Any]:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        return body
+    # openai SDK sometimes only puts detail in the message string
+    return {}
+
+
+def _error_code(exc: BaseException) -> Optional[str]:
+    err = _error_body(exc).get("error")
+    if isinstance(err, dict):
+        return err.get("code")
+    return None
+
+
+def _failed_generation(exc: BaseException) -> Optional[str]:
+    err = _error_body(exc).get("error")
+    if isinstance(err, dict):
+        fg = err.get("failed_generation")
+        if isinstance(fg, str) and fg.strip():
+            return fg.strip()
+    # Fallback: scrape from stringified exception
+    m = re.search(r"'failed_generation':\s*'((?:\\'|[^'])*)'", str(exc))
+    if m:
+        return m.group(1).encode().decode("unicode_escape")
+    m = re.search(r'"failed_generation":\s*"((?:\\"|[^"])*)"', str(exc))
+    if m:
+        return m.group(1).encode().decode("unicode_escape")
+    return None
+
+
+def _tool_calls_from_failed_generation(raw: str) -> List[ToolCall]:
+    """
+    Groq sometimes returns tool intent only inside failed_generation, e.g.
+      {"name": "find_cluster", "arguments": {"path": "/root"}}
+    or an OpenAI-ish tool_calls fragment.
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    calls: List[ToolCall] = []
+
+    def add(name: str, arguments: Any) -> None:
+        if not name:
+            return
+        if isinstance(arguments, dict):
+            args_s = json.dumps(arguments)
+        elif isinstance(arguments, str):
+            args_s = arguments
+        else:
+            args_s = "{}"
+        calls.append(
+            ToolCall(
+                id=f"recovered_{uuid.uuid4().hex[:12]}",
+                name=name,
+                arguments=args_s,
+            )
+        )
+
+    if isinstance(data, dict):
+        if "name" in data and ("arguments" in data or "parameters" in data):
+            add(data.get("name") or "", data.get("arguments", data.get("parameters")))
+        elif "tool_calls" in data and isinstance(data["tool_calls"], list):
+            for tc in data["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or tc
+                if isinstance(fn, dict):
+                    add(fn.get("name") or "", fn.get("arguments", {}))
+        elif data.get("type") == "function" and isinstance(data.get("function"), dict):
+            fn = data["function"]
+            add(fn.get("name") or "", fn.get("arguments", {}))
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "name" in item:
+                add(item.get("name") or "", item.get("arguments", item.get("parameters")))
+
+    return calls
+
+
 def _is_retryable(exc: BaseException) -> bool:
-    """True if another attempt might succeed."""
     if isinstance(exc, (APITimeoutError, APIConnectionError, RateLimitError, asyncio.TimeoutError)):
         return True
     if isinstance(exc, APIStatusError):
-        # 408 timeout, 429 rate limit, 5xx server errors
         if exc.status_code in {408, 429, 500, 502, 503, 504}:
             return True
-        # Groq: model emitted unparseable tool JSON
-        body = getattr(exc, "body", None) or {}
-        err = body.get("error") if isinstance(body, dict) else None
-        code = err.get("code") if isinstance(err, dict) else None
-        if code in {"output_parse_failed", "tool_use_failed"}:
+        code = _error_code(exc)
+        # tool_use_failed with recoverable generation is handled specially, not retried blindly
+        if code == "output_parse_failed":
             return True
         msg = str(exc).lower()
-        if "output_parse_failed" in msg or "rate_limit" in msg or "tokens per minute" in msg:
+        if "rate_limit" in msg or "tokens per minute" in msg:
             return True
-    # Some SDKs wrap as generic Exception with useful text
     msg = str(exc).lower()
-    if "rate_limit" in msg or "timeout" in msg or "output_parse_failed" in msg:
+    if "rate_limit" in msg or "timeout" in msg:
         return True
     return False
+
+
+def _retry_after_seconds(exc: BaseException, default: float) -> float:
+    """Parse Groq 'Please try again in 8.25s' if present."""
+    m = re.search(r"try again in ([0-9.]+)\s*s", str(exc), re.I)
+    if m:
+        try:
+            return max(float(m.group(1)), 0.5)
+        except ValueError:
+            pass
+    return default
 
 
 class LLM:
@@ -91,12 +175,11 @@ class LLM:
         self.max_retries = max(0, max_retries)
         self.retry_backoff_sec = retry_backoff_sec
 
-        # timeout applies to each HTTP call (connect + read)
         self._client = AsyncOpenAI(
             base_url=self.base_url,
             api_key=api_key or "unused",
             timeout=timeout_sec,
-            max_retries=0,  # we handle retries ourselves for clearer control
+            max_retries=0,
         )
         log.debug(
             "LLM ready: model=%s base_url=%s timeout=%ss retries=%s",
@@ -114,12 +197,6 @@ class LLM:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> ChatResult:
-        """
-        Send a chat completion with timeout + limited retries.
-
-        On output_parse_failed after retries, one final attempt without tools
-        so the model can still answer in plain text.
-        """
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -164,6 +241,22 @@ class LLM:
 
             except Exception as e:
                 last_exc = e
+
+                # Groq: model called a tool but API rejected the frame — recover intent
+                code = _error_code(e)
+                fg = _failed_generation(e)
+                if code == "tool_use_failed" or (
+                    fg and "tool_use_failed" in str(e).lower()
+                ):
+                    if fg:
+                        recovered = _tool_calls_from_failed_generation(fg)
+                        if recovered:
+                            log.warning(
+                                "Recovered %d tool call(s) from failed_generation",
+                                len(recovered),
+                            )
+                            return ChatResult(content="", tool_calls=recovered)
+
                 retryable = _is_retryable(e)
                 log.warning(
                     "LLM chat failed (attempt %d/%d, retryable=%s): %s",
@@ -174,30 +267,11 @@ class LLM:
                 )
                 if not retryable or attempt >= attempts:
                     break
-                await asyncio.sleep(self.retry_backoff_sec * attempt)
+                delay = _retry_after_seconds(e, self.retry_backoff_sec * attempt)
+                await asyncio.sleep(delay)
 
-        # Last-ditch: if tools were enabled and the model kept failing to parse,
-        # try once more with no tools so the user still gets a text reply.
-        if tools and last_exc is not None:
-            msg = str(last_exc).lower()
-            if "output_parse_failed" in msg or "tool_use_failed" in msg:
-                log.warning("Retrying final completion without tools after parse failure")
-                try:
-                    plain = dict(kwargs)
-                    plain.pop("tools", None)
-                    plain.pop("tool_choice", None)
-                    response = await self._client.chat.completions.create(**plain)
-                    content = (response.choices[0].message.content or "").strip()
-                    return ChatResult(
-                        content=content
-                        or (
-                            "(model failed to format a tool call; "
-                            "try a narrower question or type reset)"
-                        )
-                    )
-                except Exception as e2:
-                    last_exc = e2
-
+        # Do NOT retry with tools stripped when history expects tool calling:
+        # gpt-oss on Groq often emits tools anyway → "Tool choice is none, but model called a tool".
         assert last_exc is not None
         raise last_exc
 
@@ -208,7 +282,6 @@ class LLM:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> AsyncIterator[str]:
-        """Stream a plain text completion (no tools). Uses the same timeout."""
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
