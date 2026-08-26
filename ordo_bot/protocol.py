@@ -1,23 +1,15 @@
 """
-Bot ↔ Client WebSocket protocol (v0.1)
+Bot ↔ Client WebSocket protocol (v0.1+)
 
-This file defines the structured messages that travel between
-ordo-bot and any front-end (CLI, web UI, etc.).
-
-We use Pydantic models so every message is validated and
-easy to serialize/deserialize to JSON.
-
-Transport: Newline-Delimited JSON (NDJSON)
-  - One JSON object per line
-  - Same style that Ordo itself uses
+Transport: Newline-Delimited JSON (NDJSON).
 """
 
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Dict, Literal, Union
 from pydantic import BaseModel, Field
 
 
 # ----------------------------------------------------------------------
-# Messages that the CLIENT sends TO the bot
+# Client → bot
 # ----------------------------------------------------------------------
 
 class ChatMessage(BaseModel):
@@ -31,12 +23,16 @@ class PingMessage(BaseModel):
     type: Literal["ping"] = "ping"
 
 
-# Union of everything a client is allowed to send
-ClientMessage = Union[ChatMessage, PingMessage]
+class ResetMessage(BaseModel):
+    """Clear the agent's conversation history (keep system prompt)."""
+    type: Literal["reset"] = "reset"
+
+
+ClientMessage = Union[ChatMessage, PingMessage, ResetMessage]
 
 
 # ----------------------------------------------------------------------
-# Messages that the BOT sends TO the client
+# Bot → client
 # ----------------------------------------------------------------------
 
 class AssistantMessage(BaseModel):
@@ -47,18 +43,16 @@ class AssistantMessage(BaseModel):
 
 
 class MessageDelta(BaseModel):
-    """
-    A streaming chunk of an assistant reply.
-    Front-ends can append these as they arrive for a live typing effect.
-    """
+    """Streaming chunk of an assistant reply (future)."""
     type: Literal["message_delta"] = "message_delta"
     content: str
 
 
 class OrdoEventMessage(BaseModel):
     """
-    An event that originated from Ordo (jobs_changed, clusters_changed, etc.).
-    The bot forwards these so the UI can stay up to date.
+    Event from Ordo (jobs_changed, etc.).
+
+    Forwarded to UI only — never stored in agent chat history.
     """
     type: Literal["ordo_event"] = "ordo_event"
     event: str
@@ -66,7 +60,7 @@ class OrdoEventMessage(BaseModel):
 
 
 class StatusMessage(BaseModel):
-    """Current status of the bot (connection state, which model is in use, etc.)."""
+    """Current status of the bot."""
     type: Literal["status"] = "status"
     ordo_connected: bool
     model: str
@@ -84,7 +78,6 @@ class PongMessage(BaseModel):
     type: Literal["pong"] = "pong"
 
 
-# Union of everything the bot can send
 BotMessage = Union[
     AssistantMessage,
     MessageDelta,
@@ -96,13 +89,12 @@ BotMessage = Union[
 
 
 def parse_client_message(raw: dict) -> ClientMessage:
-    """
-    Turn a raw dict (from JSON) into a typed ClientMessage.
-    Raises ValidationError if the message is malformed.
-    """
+    """Turn a raw dict into a typed ClientMessage."""
     msg_type = raw.get("type")
     if msg_type == "chat":
         return ChatMessage.model_validate(raw)
     if msg_type == "ping":
         return PingMessage.model_validate(raw)
+    if msg_type == "reset":
+        return ResetMessage.model_validate(raw)
     raise ValueError(f"Unknown client message type: {msg_type}")

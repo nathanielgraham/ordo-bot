@@ -4,27 +4,43 @@
 # ------------------------------------------------------------------
 # Ordo connection
 # ------------------------------------------------------------------
-# Get your token from Ordo Settings (https://ordoscheduler.com)
 ordo_ws_url = "wss://ordoscheduler.com/websocket"
 ordo_token = "YOUR_ORDO_API_TOKEN_HERE"
 
 # ------------------------------------------------------------------
 # LLM (OpenAI-compatible endpoint)
 # ------------------------------------------------------------------
-# Default is local Ollama. Change these when you want to use
-# Groq, OpenRouter, xAI, etc.
 llm_base_url = "http://localhost:11434/v1"
-llm_api_key = "ollama"                   # Ollama ignores the key
+llm_api_key = "ollama"
 llm_model = "llama3.2"
+
+# Groq example:
+# llm_base_url = "https://api.groq.com/openai/v1"
+# llm_api_key = "gsk_..."
+# llm_model = "qwen/qwen3.6-27b"
+
+# Per-call LLM HTTP timeout and retries (429 / timeout / parse fail)
+llm_timeout_sec = 90
+llm_max_retries = 2
+
+# ------------------------------------------------------------------
+# Agent context hygiene / bootstrap
+# ------------------------------------------------------------------
+max_history_messages = 24
+tool_result_max_chars = 2500
+# Whole user turn (tool rounds + LLM). 0 = unlimited.
+chat_timeout_sec = 120
+
+# minimal | standard | rich
+bootstrap_mode = "standard"
+bootstrap_docs = true
+# bootstrap_playbook_path = "prompts/bootstrap.md"
+# bootstrap_extra_md = "prompts/project.md"  # rich only
 
 # ------------------------------------------------------------------
 # Frontend WebSocket server
-# (this is the port the CLI / web UI will connect to)
 # ------------------------------------------------------------------
 frontend_host = "127.0.0.1"
 frontend_port = 8765
 
-# ------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------
 log_level = "INFO"

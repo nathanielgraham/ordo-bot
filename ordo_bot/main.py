@@ -1,17 +1,5 @@
 """
 Main entry point for ordo-bot.
-
-This is what runs when the user types:
-
-    ordo-bot --config config.toml
-
-Current behaviour:
-  1. Load configuration
-  2. Connect to Ordo with the API token
-  3. Create the LLM client and Agent
-  4. Start the frontend WebSocket server (for CLI / web UI)
-  5. Optionally run smoke tests or an interactive terminal chat
-  6. Stay running until Ctrl-C
 """
 
 from __future__ import annotations
@@ -32,7 +20,6 @@ from ordo_bot.ordo_client import OrdoClient
 
 
 def setup_logging(level: str) -> None:
-    """Configure basic logging so we can see what the bot is doing."""
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -41,13 +28,8 @@ def setup_logging(level: str) -> None:
 
 
 async def interactive_chat(agent: Agent) -> None:
-    """
-    Simple terminal chat loop (alternative to the WebSocket CLI).
-
-    Type a message and press Enter. Type 'quit' or 'exit' to leave.
-    """
     log = logging.getLogger("ordo_bot")
-    log.info("Interactive chat ready. Type a message (or 'quit' to exit).")
+    log.info("Interactive chat ready. Type a message (or 'quit' / 'reset').")
     print()
 
     loop = asyncio.get_running_loop()
@@ -64,6 +46,10 @@ async def interactive_chat(agent: Agent) -> None:
             continue
         if user_text.lower() in {"quit", "exit"}:
             break
+        if user_text.lower() in {"reset", "/reset"}:
+            agent.reset()
+            print("bot> Conversation history cleared.\n")
+            continue
 
         reply = await agent.handle_chat(user_text)
         print(f"bot> {reply}")
@@ -76,53 +62,70 @@ async def run_bot(
     smoke: bool = False,
     chat: bool = False,
 ) -> None:
-    """
-    Core async loop.
-    """
     log = logging.getLogger("ordo_bot")
 
     if not settings.ordo_token:
         log.error(
             "No Ordo token configured. "
-            "Set ordo_token in config.toml or the ORDO_BOT_ORDO_TOKEN environment variable."
+            "Set ordo_token in config.toml or ORDO_BOT_ORDO_TOKEN."
         )
         raise RuntimeError("Missing Ordo token")
 
-    # ------------------------------------------------------------------
-    # LLM + Agent
-    # ------------------------------------------------------------------
     llm = LLM(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         model=settings.llm_model,
+        timeout_sec=settings.llm_timeout_sec,
+        max_retries=settings.llm_max_retries,
     )
-    # ordo is attached after login so tools become available
-    agent = Agent(llm, ordo=None)
-    log.info("LLM ready: %s @ %s", settings.llm_model, settings.llm_base_url)
 
-    # ------------------------------------------------------------------
-    # Frontend WebSocket server (clients connect here)
-    # ------------------------------------------------------------------
+    playbook = (
+        Path(settings.bootstrap_playbook_path)
+        if settings.bootstrap_playbook_path
+        else None
+    )
+    extra = (
+        Path(settings.bootstrap_extra_md)
+        if settings.bootstrap_extra_md
+        else None
+    )
+
+    agent = Agent(
+        llm,
+        ordo=None,
+        max_history_messages=settings.max_history_messages,
+        tool_result_max_chars=settings.tool_result_max_chars,
+        bootstrap_mode=settings.bootstrap_mode,
+        bootstrap_docs=settings.bootstrap_docs,
+        bootstrap_playbook_path=playbook,
+        bootstrap_extra_md=extra,
+        chat_timeout_sec=settings.chat_timeout_sec,
+    )
+    log.info("LLM ready: %s @ %s", settings.llm_model, settings.llm_base_url)
+    log.info(
+        "Timeouts: llm=%ss chat=%ss retries=%s | history_cap=%s mode=%s",
+        settings.llm_timeout_sec,
+        settings.chat_timeout_sec,
+        settings.llm_max_retries,
+        settings.max_history_messages,
+        settings.bootstrap_mode,
+    )
+
     frontend = FrontendServer(
         host=settings.frontend_host,
         port=settings.frontend_port,
         agent=agent,
-        ordo_connected=False,  # updated after Ordo login
+        ordo_connected=False,
         model=settings.llm_model,
     )
 
-    # ------------------------------------------------------------------
-    # Ordo client
-    # ------------------------------------------------------------------
     ordo = OrdoClient(
         url=settings.ordo_ws_url,
         token=settings.ordo_token,
     )
 
     async def on_ordo_message(data: dict) -> None:
-        """Forward interesting Ordo events to all frontend clients."""
         log.debug("Ordo message: %s", data)
-        # Broadcasts look like: {"broadcast": "jobs_changed", ...}
         broadcast = data.get("broadcast")
         if broadcast:
             await frontend.broadcast_ordo_event(broadcast, data)
@@ -130,37 +133,25 @@ async def run_bot(
     ordo.on_message = on_ordo_message
 
     try:
-        # Start frontend first so clients can connect while we log in
         await frontend.start()
 
         log.info("Connecting to Ordo at %s ...", settings.ordo_ws_url)
         await ordo.connect()
         log.info("Connected and logged in to Ordo")
 
-        # Enable Ordo tools now that we are logged in
         agent.ordo = ordo
+        await agent.bootstrap()
+
         frontend.ordo_connected = True
         await frontend.broadcast_status()
 
-        # ------------------------------------------------------------------
-        # Optional smoke tests
-        # ------------------------------------------------------------------
         if smoke:
-            log.info("Running Ordo smoke test: get_documentation(section='overview')")
+            log.info("Running Ordo smoke test: get_documentation")
             try:
                 reply = await ordo.get_documentation(
-                    section="overview", format="markdown"
+                    section="overview", format="summary"
                 )
-                success = reply.get("success")
-                log.info("Ordo smoke test reply success=%s", success)
-                doc = reply.get("documentation") or reply.get("content") or ""
-                if isinstance(doc, str) and doc:
-                    snippet = doc[:300].replace("\n", " ")
-                    log.info(
-                        "Documentation snippet: %s%s",
-                        snippet,
-                        "..." if len(doc) > 300 else "",
-                    )
+                log.info("Ordo smoke test success=%s", reply.get("success"))
             except Exception as e:
                 log.error("Ordo smoke test failed: %s", e)
 
@@ -173,16 +164,10 @@ async def run_bot(
             except Exception as e:
                 log.error("LLM smoke test failed: %s", e)
 
-        # ------------------------------------------------------------------
-        # Optional interactive terminal chat
-        # ------------------------------------------------------------------
         if chat:
             await interactive_chat(agent)
             return
 
-        # ------------------------------------------------------------------
-        # Idle until Ctrl-C
-        # ------------------------------------------------------------------
         log.info(
             "Bot is running. Frontend at ws://%s:%s  (Ctrl-C to stop)",
             settings.frontend_host,
@@ -203,9 +188,6 @@ async def run_bot(
 
 
 def main() -> None:
-    """
-    Entry point when the user runs `ordo-bot` or `python -m ordo_bot`.
-    """
     parser = argparse.ArgumentParser(
         description="Ordo Bot – connect your own LLM to an Ordo instance"
     )
@@ -223,7 +205,7 @@ def main() -> None:
     parser.add_argument(
         "--chat",
         action="store_true",
-        help="Interactive terminal chat with the agent (for testing)",
+        help="Interactive terminal chat with the agent",
     )
     parser.add_argument(
         "--version",
@@ -251,7 +233,7 @@ def main() -> None:
     if not settings.ordo_token:
         log.error(
             "No Ordo token configured. "
-            "Set ordo_token in config.toml or the ORDO_BOT_ORDO_TOKEN environment variable."
+            "Set ordo_token in config.toml or ORDO_BOT_ORDO_TOKEN."
         )
         sys.exit(1)
 

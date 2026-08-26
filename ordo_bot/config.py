@@ -1,13 +1,5 @@
 """
 Configuration handling for ordo-bot.
-
-We use pydantic-settings so configuration can come from:
-  - a TOML file (config.toml)
-  - environment variables
-  - defaults defined in this file
-
-This keeps secrets (API keys) out of the code and makes it easy
-for users to change settings without editing Python.
 """
 
 from pathlib import Path
@@ -18,23 +10,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """
-    Main settings class.
-
-    All fields have sensible defaults so the bot can start
-    even with a minimal config file.
-    """
+    """Main settings class."""
 
     model_config = SettingsConfigDict(
-        env_prefix="ORDO_BOT_",          # environment variables start with ORDO_BOT_
-        env_file=".env",                 # also load from a .env file if present
+        env_prefix="ORDO_BOT_",
+        env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",                  # ignore unknown fields instead of crashing
+        extra="ignore",
     )
 
-    # ------------------------------------------------------------------
-    # Ordo connection
-    # ------------------------------------------------------------------
     ordo_ws_url: str = Field(
         default="wss://ordoscheduler.com/websocket",
         description="WebSocket URL of the Ordo instance",
@@ -44,15 +28,12 @@ class Settings(BaseSettings):
         description="API token from Ordo Settings (used for login_user)",
     )
 
-    # ------------------------------------------------------------------
-    # LLM (OpenAI-compatible)
-    # ------------------------------------------------------------------
     llm_base_url: str = Field(
-        default="http://localhost:11434/v1",  # default = local Ollama
+        default="http://localhost:11434/v1",
         description="Base URL of the OpenAI-compatible API",
     )
     llm_api_key: str = Field(
-        default="ollama",                     # Ollama ignores the key, but some clients require one
+        default="ollama",
         description="API key for the LLM provider",
     )
     llm_model: str = Field(
@@ -60,9 +41,47 @@ class Settings(BaseSettings):
         description="Model name to use",
     )
 
-    # ------------------------------------------------------------------
-    # Frontend WebSocket server (the API that CLI / web UI connect to)
-    # ------------------------------------------------------------------
+    # LLM hang safeguards
+    llm_timeout_sec: float = Field(
+        default=90.0,
+        description="Timeout seconds for a single LLM HTTP call",
+    )
+    llm_max_retries: int = Field(
+        default=2,
+        description="Retries for transient LLM errors (429, timeout, parse fail)",
+    )
+
+    max_history_messages: int = Field(
+        default=24,
+        description="Max non-system messages in agent history (0 = unlimited)",
+    )
+    tool_result_max_chars: int = Field(
+        default=2500,
+        description="Max chars per tool result in LLM context",
+    )
+    # Whole user turn (all tool rounds) wall clock
+    chat_timeout_sec: float = Field(
+        default=120.0,
+        description="Max seconds for one user chat turn (0 = unlimited)",
+    )
+
+    bootstrap_mode: str = Field(
+        default="standard",
+        description="Startup guidance: minimal | standard | rich",
+    )
+    bootstrap_docs: bool = Field(
+        default=True,
+        description="Load a short live Ordo docs summary after login",
+    )
+    bootstrap_playbook_path: str = Field(
+        default="",
+        description="Optional path to playbook markdown (empty = prompts/bootstrap.md)",
+    )
+    bootstrap_extra_md: str = Field(
+        default="",
+        description="Optional extra markdown for rich mode (project guidance)",
+    )
+
     frontend_host: str = Field(
         default="127.0.0.1",
         description="Host to bind the frontend WebSocket server",
@@ -72,9 +91,6 @@ class Settings(BaseSettings):
         description="Port for the frontend WebSocket server",
     )
 
-    # ------------------------------------------------------------------
-    # Misc
-    # ------------------------------------------------------------------
     log_level: str = Field(
         default="INFO",
         description="Logging level (DEBUG, INFO, WARNING, ERROR)",
@@ -82,15 +98,8 @@ class Settings(BaseSettings):
 
 
 def load_settings(config_path: Optional[Path] = None) -> Settings:
-    """
-    Load settings, optionally from a TOML file.
-
-    If a config_path is given and the file exists, we read it.
-    Environment variables and defaults still apply on top.
-    """
     if config_path and config_path.exists():
-        # pydantic-settings can load TOML via model_validate
-        import tomllib  # Python 3.11+ standard library
+        import tomllib
 
         with open(config_path, "rb") as f:
             data = tomllib.load(f)
