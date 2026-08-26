@@ -18,8 +18,6 @@ from ordo_bot.ordo_client import OrdoClient
 
 log = logging.getLogger("ordo_bot.tools")
 
-# Default max size for a single tool result in the LLM context.
-# Configurable via Agent / settings; kept here as a fallback.
 DEFAULT_TOOL_RESULT_MAX_CHARS = 2500
 
 
@@ -44,11 +42,11 @@ def _fn(
 
 
 _ID = {"type": "integer", "description": "Numeric id"}
-_NAME = {"type": "string", "description": "Name or path"}
+_NAME = {
+    "type": "string",
+    "description": "Cluster name or path (e.g. /root, /root/ops, Monitoring)",
+}
 
-# ------------------------------------------------------------------
-# Read-only tools (always offered when Ordo is connected)
-# ------------------------------------------------------------------
 READ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn(
         "get_documentation",
@@ -69,10 +67,18 @@ READ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn("read_user", "Current user profile (name, email, org, level).", {}),
     _fn(
         "find_cluster",
-        "Look up clusters by path or name (e.g. /root, Monitoring). "
+        "Look up clusters by path or name (e.g. /root, /root/ops, Monitoring). "
+        "Pass the path/name in the 'name' argument (not 'path'). "
         "Returns a compact tree (ids, names, states) — not full scripts.",
-        {"name": _NAME},
-        ["name"],
+        {
+            "name": _NAME,
+            # Models (esp. gpt-oss) often invent 'path'; accept it client-side
+            "path": {
+                "type": "string",
+                "description": "Alias for name (path or cluster name). Prefer 'name'.",
+            },
+        },
+        [],  # name or path — enforced in run_tool
     ),
     _fn(
         "read_cluster",
@@ -108,9 +114,6 @@ READ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn("sync", "Reconcile scheduler state with actual processes on servers.", {}),
 ]
 
-# ------------------------------------------------------------------
-# Write / lifecycle tools (only when user asks to change something)
-# ------------------------------------------------------------------
 WRITE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn(
         "start_cluster",
@@ -228,7 +231,6 @@ WRITE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn("delete_cal", "WRITE: delete a calendar by id.", {"id": _ID}, ["id"]),
 ]
 
-# Full catalog (for docs / "what tools do you have?")
 TOOL_SCHEMAS: List[Dict[str, Any]] = READ_TOOL_SCHEMAS + WRITE_TOOL_SCHEMAS
 
 READ_TOOL_NAMES: Set[str] = {
@@ -238,7 +240,6 @@ WRITE_TOOL_NAMES: Set[str] = {
     t["function"]["name"] for t in WRITE_TOOL_SCHEMAS
 }
 
-# Phrases that suggest the user wants a mutating action
 _WRITE_HINTS = (
     "start", "stop", "kill", "hold", "release", "ice", "melt",
     "complete", "reset", "clone", "create", "add", "delete", "remove",
@@ -248,13 +249,11 @@ _WRITE_HINTS = (
 
 
 def user_wants_write(text: str) -> bool:
-    """Heuristic: does the user message ask to change Ordo state?"""
     lower = (text or "").lower()
     return any(h in lower for h in _WRITE_HINTS)
 
 
 def tools_for_turn(*, allow_write: bool) -> List[Dict[str, Any]]:
-    """Schemas to send to the LLM for this turn."""
     if allow_write:
         return TOOL_SCHEMAS
     return READ_TOOL_SCHEMAS
@@ -267,10 +266,6 @@ def _trim_text(text: str, max_chars: int) -> str:
 
 
 def _compact_cluster_tree(node: Any, depth: int = 0) -> Any:
-    """
-    Shrink find_cluster / nested cluster payloads for the LLM.
-    Keep id, name, jobstate, and children; drop scripts and bulky fields.
-    """
     if isinstance(node, list):
         return [_compact_cluster_tree(x, depth) for x in node[:50]]
     if not isinstance(node, dict):
@@ -286,7 +281,6 @@ def _compact_cluster_tree(node: Any, depth: int = 0) -> Any:
         "cal_name": node.get("cal_name"),
         "auto_start": node.get("auto_start"),
     }
-    # Nested jobs (compact)
     jobs = node.get("jobs") or node.get("job") or []
     if isinstance(jobs, list) and jobs:
         keep["jobs"] = [
@@ -300,7 +294,6 @@ def _compact_cluster_tree(node: Any, depth: int = 0) -> Any:
             for j in jobs[:40]
             if isinstance(j, dict)
         ]
-    # Nested clusters
     kids = node.get("clusters") or node.get("children") or []
     if isinstance(kids, list) and kids:
         keep["clusters"] = [_compact_cluster_tree(c, depth + 1) for c in kids[:40]]
@@ -308,21 +301,17 @@ def _compact_cluster_tree(node: Any, depth: int = 0) -> Any:
 
 
 def _prepare_result(name: str, data: Any, max_chars: int) -> str:
-    """Serialize tool result, compacting heavy commands."""
     if name == "find_cluster" and isinstance(data, dict):
-        # Prefer compacting the tree under common keys
         out = dict(data)
         for key in ("clusters", "cluster", "tree", "data"):
             if key in out:
                 out[key] = _compact_cluster_tree(out[key])
                 break
         else:
-            # Whole reply might be the cluster
             if "id" in out and "name" in out:
                 out = _compact_cluster_tree(out)
         text = json.dumps(out, default=str)
     elif name == "find_monitor" and isinstance(data, dict):
-        # Drop ultra-noisy metrics if present; keep id/name/host/success
         monitors = data.get("monitors") or data.get("servers") or data.get("data")
         if isinstance(monitors, list):
             slim = []
@@ -347,6 +336,24 @@ def _prepare_result(name: str, data: Any, max_chars: int) -> str:
     return _trim_text(text, max_chars)
 
 
+def _normalize_args(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Fix common model quirks before sending to Ordo."""
+    args = dict(arguments or {})
+    if name == "find_cluster":
+        # gpt-oss often sends path instead of / in addition to name
+        if not args.get("name") and args.get("path"):
+            args["name"] = args.pop("path")
+        elif args.get("path") and args.get("name"):
+            # prefer non-empty name; else path
+            if not str(args.get("name") or "").strip():
+                args["name"] = args.pop("path")
+            else:
+                args.pop("path", None)
+        if not args.get("name"):
+            args["name"] = "/root"
+    return args
+
+
 _PASSTHROUGH = READ_TOOL_NAMES | WRITE_TOOL_NAMES
 
 
@@ -357,15 +364,15 @@ async def run_tool(
     *,
     max_chars: int = DEFAULT_TOOL_RESULT_MAX_CHARS,
 ) -> str:
-    """Execute one tool; return JSON string for the model."""
     log.info("Tool call: %s(%s)", name, arguments)
     try:
         if name not in _PASSTHROUGH:
             return json.dumps({"error": f"Unknown tool: {name}"})
 
+        args = _normalize_args(name, arguments)
         cmd: Dict[str, Any] = {"command": name}
-        for k, v in (arguments or {}).items():
-            if v is not None:
+        for k, v in args.items():
+            if v is not None and k != "path":
                 cmd[k] = v
 
         if name == "get_documentation":
