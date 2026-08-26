@@ -17,6 +17,7 @@ from ordo_bot.config import load_settings
 from ordo_bot.frontend_server import FrontendServer
 from ordo_bot.llm import LLM
 from ordo_bot.ordo_client import OrdoClient
+from ordo_bot.watches import WatchRegistry
 
 
 def setup_logging(level: str) -> None:
@@ -90,9 +91,12 @@ async def run_bot(
         else None
     )
 
+    watches = WatchRegistry()
+
     agent = Agent(
         llm,
         ordo=None,
+        watches=watches,
         max_history_messages=settings.max_history_messages,
         tool_result_max_chars=settings.tool_result_max_chars,
         bootstrap_mode=settings.bootstrap_mode,
@@ -102,14 +106,6 @@ async def run_bot(
         chat_timeout_sec=settings.chat_timeout_sec,
     )
     log.info("LLM ready: %s @ %s", settings.llm_model, settings.llm_base_url)
-    log.info(
-        "Timeouts: llm=%ss chat=%ss retries=%s | history_cap=%s mode=%s",
-        settings.llm_timeout_sec,
-        settings.chat_timeout_sec,
-        settings.llm_max_retries,
-        settings.max_history_messages,
-        settings.bootstrap_mode,
-    )
 
     frontend = FrontendServer(
         host=settings.frontend_host,
@@ -117,6 +113,7 @@ async def run_bot(
         agent=agent,
         ordo_connected=False,
         model=settings.llm_model,
+        watches=watches,
     )
 
     ordo = OrdoClient(
@@ -197,16 +194,8 @@ def main() -> None:
         default=Path("config.toml"),
         help="Path to the TOML config file (default: config.toml)",
     )
-    parser.add_argument(
-        "--smoke",
-        action="store_true",
-        help="After login, run quick Ordo + LLM test commands",
-    )
-    parser.add_argument(
-        "--chat",
-        action="store_true",
-        help="Interactive terminal chat with the agent",
-    )
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--chat", action="store_true")
     parser.add_argument(
         "--version",
         action="version",
@@ -215,7 +204,6 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = load_settings(args.config)
-
     setup_logging(settings.log_level)
     log = logging.getLogger("ordo_bot")
 
@@ -224,22 +212,13 @@ def main() -> None:
         "LLM endpoint: %s  (model: %s)", settings.llm_base_url, settings.llm_model
     )
     log.info("Ordo URL: %s", settings.ordo_ws_url)
-    log.info(
-        "Frontend will listen on %s:%s",
-        settings.frontend_host,
-        settings.frontend_port,
-    )
 
     if not settings.ordo_token:
-        log.error(
-            "No Ordo token configured. "
-            "Set ordo_token in config.toml or ORDO_BOT_ORDO_TOKEN."
-        )
+        log.error("No Ordo token configured.")
         sys.exit(1)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
     main_task = loop.create_task(
         run_bot(settings, smoke=args.smoke, chat=args.chat)
     )

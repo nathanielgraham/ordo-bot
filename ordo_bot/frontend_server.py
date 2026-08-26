@@ -1,9 +1,7 @@
 """
 Frontend WebSocket server.
 
-Chat messages are queued and processed one at a time (shared agent history).
-Clients get an immediate ack, then progress, then the final message.
-Reset clears history and drops the pending queue immediately.
+Chat queue + completion watches driven by Ordo broadcasts.
 """
 
 from __future__ import annotations
@@ -12,7 +10,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -28,6 +26,7 @@ from ordo_bot.protocol import (
     StatusMessage,
     parse_client_message,
 )
+from ordo_bot.watches import WatchRegistry
 
 log = logging.getLogger("ordo_bot.frontend")
 
@@ -39,8 +38,6 @@ class _QueuedChat:
 
 
 class FrontendServer:
-    """Async WebSocket server for front-end clients."""
-
     def __init__(
         self,
         host: str,
@@ -49,20 +46,19 @@ class FrontendServer:
         *,
         ordo_connected: bool = False,
         model: str = "",
+        watches: Optional[WatchRegistry] = None,
     ) -> None:
         self.host = host
         self.port = port
         self.agent = agent
         self.ordo_connected = ordo_connected
         self.model = model
+        self.watches = watches or WatchRegistry()
 
         self._server: Any = None
         self._clients: Set[WebSocketServerProtocol] = set()
-
-        # Single shared queue — agent history is global
         self._queue: asyncio.Queue[Optional[_QueuedChat]] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
-        # Generation bumped on reset so in-flight work can skip sending a stale reply
         self._epoch: int = 0
 
     async def start(self) -> None:
@@ -78,7 +74,7 @@ class FrontendServer:
 
     async def stop(self) -> None:
         if self._worker_task is not None:
-            await self._queue.put(None)  # poison pill
+            await self._queue.put(None)
             try:
                 await asyncio.wait_for(self._worker_task, timeout=5)
             except Exception:
@@ -96,6 +92,23 @@ class FrontendServer:
     async def broadcast_ordo_event(self, event: str, data: Dict[str, Any]) -> None:
         msg = OrdoEventMessage(event=event, data=data)
         await self._broadcast(msg.model_dump())
+        # Completion watches (async notify, not in agent history)
+        await self._fire_watches(event, data)
+
+    async def _fire_watches(self, event: str, data: Dict[str, Any]) -> None:
+        fired = self.watches.match_broadcast(event, data)
+        for item in fired:
+            client = item.get("client")
+            text = item.get("text") or ""
+            if client is None:
+                # Notify all clients if no specific socket
+                await self._broadcast(
+                    AssistantMessage(content=text).model_dump()
+                )
+            else:
+                await self._safe_send(
+                    client, AssistantMessage(content=text).model_dump()
+                )
 
     async def broadcast_status(self) -> None:
         msg = StatusMessage(
@@ -124,7 +137,6 @@ class FrontendServer:
             self._clients.discard(ws)
 
     def _drain_queue(self) -> int:
-        """Drop all pending chats. Returns how many were discarded."""
         n = 0
         while True:
             try:
@@ -132,7 +144,6 @@ class FrontendServer:
             except asyncio.QueueEmpty:
                 break
             if item is None:
-                # put poison back for worker shutdown
                 self._queue.put_nowait(None)
                 break
             n += 1
@@ -140,7 +151,6 @@ class FrontendServer:
         return n
 
     async def _chat_worker(self) -> None:
-        """Process queued chats one at a time."""
         log.info("Chat queue worker started")
         while True:
             item = await self._queue.get()
@@ -156,7 +166,9 @@ class FrontendServer:
                 )
 
                 try:
-                    reply = await self.agent.handle_chat(content)
+                    reply = await self.agent.handle_chat(
+                        content, client=ws
+                    )
                 except Exception as e:
                     log.exception("Agent error")
                     if self._epoch == epoch:
@@ -165,7 +177,6 @@ class FrontendServer:
                         )
                     continue
 
-                # If reset ran while we were working, skip the stale reply
                 if self._epoch != epoch:
                     log.info("Dropping stale reply after reset")
                     continue
@@ -195,6 +206,7 @@ class FrontendServer:
         except Exception:
             log.exception("Error handling client %s", peer)
         finally:
+            self.watches.clear_for_client(ws)
             self._clients.discard(ws)
             log.info("Client disconnected: %s", peer)
 
@@ -218,11 +230,11 @@ class FrontendServer:
             return
 
         if msg.type == "reset":
-            # Immediate: bump epoch, drain queue, clear agent
             self._epoch += 1
             dropped = self._drain_queue()
+            self.watches.clear_all()
             self.agent.reset()
-            log.info("Reset: cleared history, dropped %d queued chat(s)", dropped)
+            log.info("Reset: history + queue + watches cleared")
             note = "Conversation history cleared."
             if dropped:
                 note += f" Dropped {dropped} queued message(s)."
