@@ -41,14 +41,20 @@ _NAME = {
     "description": "Cluster name or path (e.g. /root, Monitoring)",
 }
 
+_WATCH_JOBSTATE = {
+    "type": "string",
+    "description": (
+        "REQUIRED when the user cares about a specific state (e.g. complete). "
+        "Matched against jobstate on the broadcast update. "
+        "Omit only if any update for this id should notify."
+    ),
+}
+
 READ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn(
         "get_documentation",
         "Fetch Ordo documentation. Prefer format=summary.",
-        {
-            "section": {"type": "string"},
-            "format": {"type": "string"},
-        },
+        {"section": {"type": "string"}, "format": {"type": "string"}},
         ["section"],
     ),
     _fn("read_org", "Org / account info.", {}),
@@ -72,47 +78,49 @@ READ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn("sync", "Reconcile scheduler with server processes.", {}),
     _fn(
         "watch_event",
-        "Generic: notify when an Ordo broadcast matches. "
-        "event e.g. jobs_changed, clusters_changed, or *. "
-        "filter is an object matched against each update (id, name, jobstate). "
-        "jobstate may be a string, list, or the special value 'terminal'. "
-        "once=true (default) removes the watch after the first match.",
+        "Subscribe to Ordo WebSocket broadcasts. Fires only when a matching "
+        "broadcast arrives (never polls). Always put the narrowest filter you can: "
+        "id and jobstate when the user asks for a specific outcome (e.g. complete).",
         {
             "event": {
                 "type": "string",
-                "description": "Broadcast name (jobs_changed, clusters_changed, *)",
+                "description": "Broadcast name: job_updated, jobs_changed, cluster_updated, clusters_changed, or *",
             },
             "filter": {
                 "type": "object",
-                "description": "Equality filters on update objects (id, name, jobstate, ...)",
+                "description": "Matched against each object in broadcast updates (id, name, jobstate, ...)",
             },
             "id": {"type": "integer", "description": "Shorthand → filter.id"},
             "name": {"type": "string", "description": "Shorthand → filter.name"},
             "jobstate": {
                 "type": "string",
-                "description": "Shorthand → filter.jobstate (or 'terminal')",
+                "description": "Shorthand → filter.jobstate (e.g. complete, running, failed)",
             },
             "label": {"type": "string"},
-            "once": {"type": "boolean", "description": "Default true"},
+            "once": {"type": "boolean", "description": "Default true — remove watch after first match"},
         },
         ["event"],
     ),
     _fn(
         "watch_cluster",
-        "Sugar for watch_event on clusters_changed with id + terminal jobstate. "
-        "Call after start_cluster when the user wants a completion notice.",
+        "Watch Ordo cluster_* / clusters_changed broadcasts for one cluster id. "
+        "When the user says 'when it completes', you MUST pass jobstate='complete' "
+        "or the first intermediate update (e.g. ready/running) will notify instead.",
         {
             "id": _ID,
+            "jobstate": _WATCH_JOBSTATE,
             "label": {"type": "string"},
         },
         ["id"],
     ),
     _fn(
         "watch_job",
-        "Sugar for watch_event on jobs_changed with id + terminal jobstate. "
-        "Call after start_job when the user wants a completion notice.",
+        "Watch Ordo job_updated / jobs_changed broadcasts for one job id. "
+        "When the user says 'when it completes', you MUST pass jobstate='complete' "
+        "or the first intermediate update (e.g. running) will notify instead.",
         {
             "id": _ID,
+            "jobstate": _WATCH_JOBSTATE,
             "label": {"type": "string"},
         },
         ["id"],
