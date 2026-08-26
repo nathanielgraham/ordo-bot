@@ -2,11 +2,8 @@
 """
 Reference CLI client for ordo-bot.
 
-Fire-and-forget input: type the next message while one is processing.
-Server sends ack → progress → message/error.
-
-    python clients/cli.py
-    python clients/cli.py --verbose
+Fire-and-forget input; redraws you> after bot lines so the prompt returns
+without needing a blank Enter.
 """
 
 from __future__ import annotations
@@ -55,9 +52,10 @@ def summarize_ordo_event(data: Dict[str, Any]) -> str:
     return f"[ordo] {event}"
 
 
-def _print_bot_line(prefix: str, text: str) -> None:
-    """Print without breaking a mid-line prompt too badly."""
+def _print_bot_line(prefix: str, text: str, *, redraw_prompt: bool = False) -> None:
     print(f"\r{prefix}{text}")
+    if redraw_prompt:
+        print("you> ", end="", flush=True)
 
 
 async def _read_line(prompt: str) -> str:
@@ -87,9 +85,10 @@ async def run(url: str, verbose: bool = False) -> None:
 
         disconnect = asyncio.Event()
         stop_reader = asyncio.Event()
+        # True while blocked in input() — so we can re-print you> after bot lines
+        at_prompt = asyncio.Event()
 
         async def recv_loop() -> None:
-            """Print server messages as they arrive; never block the prompt."""
             try:
                 while not stop_reader.is_set():
                     try:
@@ -104,40 +103,59 @@ async def run(url: str, verbose: bool = False) -> None:
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
-                        _print_bot_line("bot> ", f"(non-JSON) {raw}")
+                        _print_bot_line(
+                            "bot> ",
+                            f"(non-JSON) {raw}",
+                            redraw_prompt=at_prompt.is_set(),
+                        )
                         continue
 
                     msg_type = data.get("type")
+                    redraw = at_prompt.is_set()
+
                     if msg_type == "ack":
                         depth = data.get("queue_depth", 0)
-                        if depth:
-                            _print_bot_line(
-                                "… ",
-                                f"received (queued behind {depth})",
-                            )
-                        else:
-                            _print_bot_line("… ", "received")
+                        msg = (
+                            f"received (queued behind {depth})"
+                            if depth
+                            else "received"
+                        )
+                        _print_bot_line("… ", msg, redraw_prompt=redraw)
                     elif msg_type == "progress":
                         _print_bot_line(
-                            "… ", data.get("content") or "processing"
+                            "… ",
+                            data.get("content") or "processing",
+                            redraw_prompt=redraw,
                         )
                     elif msg_type == "message":
-                        _print_bot_line("bot> ", data.get("content") or "")
-                        print()
-                    elif msg_type == "error":
                         _print_bot_line(
-                            "bot> ERROR: ", data.get("message") or ""
+                            "bot> ",
+                            data.get("content") or "",
+                            redraw_prompt=False,
                         )
                         print()
+                        if redraw:
+                            print("you> ", end="", flush=True)
+                    elif msg_type == "error":
+                        _print_bot_line(
+                            "bot> ERROR: ",
+                            data.get("message") or "",
+                            redraw_prompt=False,
+                        )
+                        print()
+                        if redraw:
+                            print("you> ", end="", flush=True)
                     elif msg_type == "ordo_event":
                         if verbose:
-                            _print_bot_line("", summarize_ordo_event(data))
-                    elif msg_type == "status":
-                        continue
-                    elif msg_type == "pong":
+                            _print_bot_line(
+                                "",
+                                summarize_ordo_event(data),
+                                redraw_prompt=redraw,
+                            )
+                    elif msg_type in ("status", "pong"):
                         continue
                     elif verbose:
-                        _print_bot_line("[recv] ", str(data))
+                        _print_bot_line("[recv] ", str(data), redraw_prompt=redraw)
             finally:
                 disconnect.set()
 
@@ -149,12 +167,14 @@ async def run(url: str, verbose: bool = False) -> None:
                     print("\n[disconnected] ordo-bot closed the connection.")
                     break
 
+                at_prompt.set()
                 line_task = asyncio.create_task(_read_line("you> "))
                 disc_task = asyncio.create_task(disconnect.wait())
                 done, _pending = await asyncio.wait(
                     {line_task, disc_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                at_prompt.clear()
 
                 if disc_task in done:
                     line_task.cancel()
@@ -198,7 +218,6 @@ async def run(url: str, verbose: bool = False) -> None:
                 except ConnectionClosed:
                     print("\n[disconnected] ordo-bot closed the connection.")
                     break
-                # Do not wait for reply — recv_loop prints ack/progress/message
         finally:
             stop_reader.set()
             reader.cancel()
@@ -215,17 +234,8 @@ async def run(url: str, verbose: bool = False) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="ordo-bot CLI client")
-    p.add_argument(
-        "--url",
-        default="ws://127.0.0.1:8765",
-        help="Frontend WebSocket URL",
-    )
-    p.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Show one-line summaries of Ordo events",
-    )
+    p.add_argument("--url", default="ws://127.0.0.1:8765")
+    p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
     try:
         asyncio.run(run(args.url, verbose=args.verbose))
