@@ -2,15 +2,11 @@
 """
 Reference CLI client for ordo-bot.
 
+Fire-and-forget input: type the next message while one is processing.
+Server sends ack → progress → message/error.
+
     python clients/cli.py
     python clients/cli.py --verbose
-
-Commands:
-  quit / exit  — leave
-  reset        — clear agent conversation history
-
-If the bot process stops, the client prints a message and exits
-instead of sitting forever on the prompt.
 """
 
 from __future__ import annotations
@@ -19,7 +15,7 @@ import argparse
 import asyncio
 import json
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 try:
     import readline  # noqa: F401
@@ -59,18 +55,19 @@ def summarize_ordo_event(data: Dict[str, Any]) -> str:
     return f"[ordo] {event}"
 
 
+def _print_bot_line(prefix: str, text: str) -> None:
+    """Print without breaking a mid-line prompt too badly."""
+    print(f"\r{prefix}{text}")
+
+
 async def _read_line(prompt: str) -> str:
-    """Blocking input in a thread so the event loop can still watch the socket."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: input(prompt))
 
 
 async def run(url: str, verbose: bool = False) -> None:
     print(f"Connecting to {url} ...")
-    try:
-        ws = await websockets.connect(url, ping_interval=20, ping_timeout=20)
-    except ConnectionRefusedError:
-        raise
+    ws = await websockets.connect(url, ping_interval=20, ping_timeout=20)
 
     try:
         raw = await ws.recv()
@@ -84,40 +81,77 @@ async def run(url: str, verbose: bool = False) -> None:
             print(f"Connected. (first message: {raw})")
 
         print(
-            "Type a message and press Enter. "
-            "'quit' to exit, 'reset' to clear history.\n"
+            "Type a message and press Enter (fire-and-forget; no need to wait).\n"
+            "'quit' to exit, 'reset' to clear history + queue.\n"
         )
 
-        # Background task: notice server death while we sit at the prompt
         disconnect = asyncio.Event()
+        stop_reader = asyncio.Event()
 
-        async def watch_connection() -> None:
-            """
-            Wait until the server closes. We do not consume chat replies here;
-            those are read in the main loop. ping failures / close frames
-            surface as ConnectionClosed on recv.
-            """
+        async def recv_loop() -> None:
+            """Print server messages as they arrive; never block the prompt."""
             try:
-                # Wait until the connection is closed without stealing messages.
-                # connection_lost / wait_closed is the right signal.
-                await ws.wait_closed()
-            except Exception:
-                pass
+                while not stop_reader.is_set():
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        if ws.close_code is not None:
+                            break
+                        continue
+                    except ConnectionClosed:
+                        break
+
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        _print_bot_line("bot> ", f"(non-JSON) {raw}")
+                        continue
+
+                    msg_type = data.get("type")
+                    if msg_type == "ack":
+                        depth = data.get("queue_depth", 0)
+                        if depth:
+                            _print_bot_line(
+                                "… ",
+                                f"received (queued behind {depth})",
+                            )
+                        else:
+                            _print_bot_line("… ", "received")
+                    elif msg_type == "progress":
+                        _print_bot_line(
+                            "… ", data.get("content") or "processing"
+                        )
+                    elif msg_type == "message":
+                        _print_bot_line("bot> ", data.get("content") or "")
+                        print()
+                    elif msg_type == "error":
+                        _print_bot_line(
+                            "bot> ERROR: ", data.get("message") or ""
+                        )
+                        print()
+                    elif msg_type == "ordo_event":
+                        if verbose:
+                            _print_bot_line("", summarize_ordo_event(data))
+                    elif msg_type == "status":
+                        continue
+                    elif msg_type == "pong":
+                        continue
+                    elif verbose:
+                        _print_bot_line("[recv] ", str(data))
             finally:
                 disconnect.set()
 
-        watcher = asyncio.create_task(watch_connection())
+        reader = asyncio.create_task(recv_loop())
 
         try:
             while True:
-                if disconnect.is_set() or ws.close_code is not None:
+                if disconnect.is_set():
                     print("\n[disconnected] ordo-bot closed the connection.")
                     break
 
-                # Race: user types a line OR server dies
                 line_task = asyncio.create_task(_read_line("you> "))
                 disc_task = asyncio.create_task(disconnect.wait())
-                done, pending = await asyncio.wait(
+                done, _pending = await asyncio.wait(
                     {line_task, disc_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -131,7 +165,6 @@ async def run(url: str, verbose: bool = False) -> None:
                     print("\n[disconnected] ordo-bot closed the connection.")
                     break
 
-                # User line ready
                 disc_task.cancel()
                 try:
                     await disc_task
@@ -143,12 +176,11 @@ async def run(url: str, verbose: bool = False) -> None:
                 except (EOFError, KeyboardInterrupt):
                     print()
                     break
-                except Exception as e:
-                    # e.g. input error after disconnect
+                except Exception:
                     if disconnect.is_set():
                         print("\n[disconnected] ordo-bot closed the connection.")
                         break
-                    raise e
+                    raise
 
                 user_text = user_text.strip()
                 if not user_text:
@@ -166,52 +198,12 @@ async def run(url: str, verbose: bool = False) -> None:
                 except ConnectionClosed:
                     print("\n[disconnected] ordo-bot closed the connection.")
                     break
-
-                # Wait for assistant message / error (skip events)
-                got_reply = False
-                while not got_reply:
-                    if disconnect.is_set():
-                        print("\n[disconnected] ordo-bot closed the connection.")
-                        got_reply = True
-                        break
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        continue
-                    except ConnectionClosed:
-                        print("\n[disconnected] ordo-bot closed the connection.")
-                        got_reply = True
-                        break
-
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        print(f"bot> (non-JSON) {raw}")
-                        break
-
-                    msg_type = data.get("type")
-                    if msg_type == "message":
-                        print(f"bot> {data.get('content', '')}")
-                        print()
-                        got_reply = True
-                    elif msg_type == "error":
-                        print(f"bot> ERROR: {data.get('message', '')}")
-                        print()
-                        got_reply = True
-                    elif msg_type == "ordo_event":
-                        if verbose:
-                            print(summarize_ordo_event(data))
-                    elif msg_type == "status":
-                        continue
-                    elif verbose:
-                        print(f"[recv] {data}")
-
-                if disconnect.is_set():
-                    break
+                # Do not wait for reply — recv_loop prints ack/progress/message
         finally:
-            watcher.cancel()
+            stop_reader.set()
+            reader.cancel()
             try:
-                await watcher
+                await reader
             except (asyncio.CancelledError, Exception):
                 pass
     finally:

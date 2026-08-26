@@ -1,9 +1,9 @@
 """
 Frontend WebSocket server.
 
-Clients talk to ordo-bot; ordo-bot talks to Ordo and the LLM.
-
-Ordo broadcasts are forwarded here only — they never enter agent history.
+Chat messages are queued and processed one at a time (shared agent history).
+Clients get an immediate ack, then progress, then the final message.
+Reset clears history and drops the pending queue immediately.
 """
 
 from __future__ import annotations
@@ -11,22 +11,31 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict, Set
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set
 
 import websockets
 from websockets.server import WebSocketServerProtocol
 
 from ordo_bot.agent import Agent
 from ordo_bot.protocol import (
+    AckMessage,
     AssistantMessage,
     ErrorMessage,
     OrdoEventMessage,
     PongMessage,
+    ProgressMessage,
     StatusMessage,
     parse_client_message,
 )
 
 log = logging.getLogger("ordo_bot.frontend")
+
+
+@dataclass
+class _QueuedChat:
+    ws: WebSocketServerProtocol
+    content: str
 
 
 class FrontendServer:
@@ -49,9 +58,15 @@ class FrontendServer:
 
         self._server: Any = None
         self._clients: Set[WebSocketServerProtocol] = set()
-        self._chat_lock = asyncio.Lock()
+
+        # Single shared queue — agent history is global
+        self._queue: asyncio.Queue[Optional[_QueuedChat]] = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task] = None
+        # Generation bumped on reset so in-flight work can skip sending a stale reply
+        self._epoch: int = 0
 
     async def start(self) -> None:
+        self._worker_task = asyncio.create_task(self._chat_worker())
         self._server = await websockets.serve(
             self._handle_client,
             self.host,
@@ -62,6 +77,14 @@ class FrontendServer:
         log.info("Frontend WebSocket listening on ws://%s:%s", self.host, self.port)
 
     async def stop(self) -> None:
+        if self._worker_task is not None:
+            await self._queue.put(None)  # poison pill
+            try:
+                await asyncio.wait_for(self._worker_task, timeout=5)
+            except Exception:
+                self._worker_task.cancel()
+            self._worker_task = None
+
         if self._server is None:
             return
         self._server.close()
@@ -71,7 +94,6 @@ class FrontendServer:
         log.info("Frontend WebSocket stopped")
 
     async def broadcast_ordo_event(self, event: str, data: Dict[str, Any]) -> None:
-        """UI-only: never written into agent.messages."""
         msg = OrdoEventMessage(event=event, data=data)
         await self._broadcast(msg.model_dump())
 
@@ -95,6 +117,65 @@ class FrontendServer:
         for ws in dead:
             self._clients.discard(ws)
 
+    async def _safe_send(self, ws: WebSocketServerProtocol, payload: dict) -> None:
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception:
+            self._clients.discard(ws)
+
+    def _drain_queue(self) -> int:
+        """Drop all pending chats. Returns how many were discarded."""
+        n = 0
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is None:
+                # put poison back for worker shutdown
+                self._queue.put_nowait(None)
+                break
+            n += 1
+            self._queue.task_done()
+        return n
+
+    async def _chat_worker(self) -> None:
+        """Process queued chats one at a time."""
+        log.info("Chat queue worker started")
+        while True:
+            item = await self._queue.get()
+            try:
+                if item is None:
+                    return
+
+                epoch = self._epoch
+                ws, content = item.ws, item.content
+
+                await self._safe_send(
+                    ws, ProgressMessage(content="processing").model_dump()
+                )
+
+                try:
+                    reply = await self.agent.handle_chat(content)
+                except Exception as e:
+                    log.exception("Agent error")
+                    if self._epoch == epoch:
+                        await self._safe_send(
+                            ws, ErrorMessage(message=str(e)).model_dump()
+                        )
+                    continue
+
+                # If reset ran while we were working, skip the stale reply
+                if self._epoch != epoch:
+                    log.info("Dropping stale reply after reset")
+                    continue
+
+                await self._safe_send(
+                    ws, AssistantMessage(content=reply).model_dump()
+                )
+            finally:
+                self._queue.task_done()
+
     async def _handle_client(self, ws: WebSocketServerProtocol) -> None:
         peer = getattr(ws, "remote_address", None)
         log.info("Client connected: %s", peer)
@@ -104,21 +185,16 @@ class FrontendServer:
             ordo_connected=self.ordo_connected,
             model=self.model,
         )
-        await ws.send(json.dumps(status.model_dump()))
+        await self._safe_send(ws, status.model_dump())
 
-        pending: Set[asyncio.Task] = set()
         try:
             async for raw in ws:
-                task = asyncio.create_task(self._handle_message(ws, raw))
-                pending.add(task)
-                task.add_done_callback(pending.discard)
+                await self._handle_message(ws, raw)
         except websockets.ConnectionClosed:
             pass
         except Exception:
             log.exception("Error handling client %s", peer)
         finally:
-            for task in pending:
-                task.cancel()
             self._clients.discard(ws)
             log.info("Client disconnected: %s", peer)
 
@@ -126,40 +202,38 @@ class FrontendServer:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            err = ErrorMessage(message="invalid JSON")
-            await ws.send(json.dumps(err.model_dump()))
+            await self._safe_send(ws, ErrorMessage(message="invalid JSON").model_dump())
             return
 
         try:
             msg = parse_client_message(data)
         except Exception as e:
-            err = ErrorMessage(message=f"bad message: {e}")
-            await ws.send(json.dumps(err.model_dump()))
+            await self._safe_send(
+                ws, ErrorMessage(message=f"bad message: {e}").model_dump()
+            )
             return
 
         if msg.type == "ping":
-            await ws.send(json.dumps(PongMessage().model_dump()))
+            await self._safe_send(ws, PongMessage().model_dump())
             return
 
         if msg.type == "reset":
+            # Immediate: bump epoch, drain queue, clear agent
+            self._epoch += 1
+            dropped = self._drain_queue()
             self.agent.reset()
-            out = AssistantMessage(content="Conversation history cleared.")
-            await ws.send(json.dumps(out.model_dump()))
+            log.info("Reset: cleared history, dropped %d queued chat(s)", dropped)
+            note = "Conversation history cleared."
+            if dropped:
+                note += f" Dropped {dropped} queued message(s)."
+            await self._safe_send(ws, AssistantMessage(content=note).model_dump())
             return
 
         if msg.type == "chat":
-            await self._handle_chat(ws, msg.content)
+            depth = self._queue.qsize()
+            await self._queue.put(_QueuedChat(ws=ws, content=msg.content))
+            await self._safe_send(
+                ws,
+                AckMessage(content="received", queue_depth=depth).model_dump(),
+            )
             return
-
-    async def _handle_chat(self, ws: WebSocketServerProtocol, content: str) -> None:
-        async with self._chat_lock:
-            try:
-                reply = await self.agent.handle_chat(content)
-            except Exception as e:
-                log.exception("Agent error")
-                err = ErrorMessage(message=str(e))
-                await ws.send(json.dumps(err.model_dump()))
-                return
-
-            out = AssistantMessage(content=reply)
-            await ws.send(json.dumps(out.model_dump()))
