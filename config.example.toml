@@ -4,9 +4,9 @@
 # ------------------------------------------------------------------
 # Ordo connection
 # ------------------------------------------------------------------
-ordo_ws_url = "ws://localhost:8080/ws"   # change to your Ordo WebSocket URL
-ordo_username = "your_username"
-ordo_password = "your_password"
+# Get your token from Ordo Settings (https://ordoscheduler.com)
+ordo_ws_url = "wss://ordoscheduler.com/websocket"
+ordo_token = "YOUR_ORDO_API_TOKEN_HERE"
 
 # ------------------------------------------------------------------
 # LLM (OpenAI-compatible endpoint)
