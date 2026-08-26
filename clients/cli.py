@@ -147,6 +147,10 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Ctrl-C at the prompt — quiet exit, no traceback
+        print()
+        sys.exit(0)
 
 
 if __name__ == "__main__":
