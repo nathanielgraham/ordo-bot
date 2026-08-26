@@ -19,25 +19,23 @@ llm_model = "llama3.2"
 # llm_api_key = "gsk_..."
 # llm_model = "qwen/qwen3.6-27b"
 
+# Per-call LLM HTTP timeout and retries (429 / timeout / parse fail)
+llm_timeout_sec = 90
+llm_max_retries = 2
+
 # ------------------------------------------------------------------
 # Agent context hygiene / bootstrap
 # ------------------------------------------------------------------
-# Max non-system messages kept in history. 0 = unlimited (large models).
 max_history_messages = 24
-# Max characters of each tool result stored for the LLM.
 tool_result_max_chars = 2500
+# Whole user turn (tool rounds + LLM). 0 = unlimited.
+chat_timeout_sec = 120
 
-# Startup guidance:
-#   minimal  — short system prompt only (tight TPM / tiny models)
-#   standard — fixed prompts/bootstrap.md + optional live docs (default)
-#   rich     — standard + optional project markdown (opt-in)
+# minimal | standard | rich
 bootstrap_mode = "standard"
-# Live get_documentation summary after login (ignored when mode=minimal)
 bootstrap_docs = true
-# Override playbook path (empty = prompts/bootstrap.md)
 # bootstrap_playbook_path = "prompts/bootstrap.md"
-# Project-specific notes (only read when bootstrap_mode = "rich")
-# bootstrap_extra_md = "prompts/project.md"
+# bootstrap_extra_md = "prompts/project.md"  # rich only
 
 # ------------------------------------------------------------------
 # Frontend WebSocket server
@@ -45,7 +43,4 @@ bootstrap_docs = true
 frontend_host = "127.0.0.1"
 frontend_port = 8765
 
-# ------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------
 log_level = "INFO"

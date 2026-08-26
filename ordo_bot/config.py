@@ -41,9 +41,16 @@ class Settings(BaseSettings):
         description="Model name to use",
     )
 
-    # ------------------------------------------------------------------
-    # Agent context hygiene / bootstrap
-    # ------------------------------------------------------------------
+    # LLM hang safeguards
+    llm_timeout_sec: float = Field(
+        default=90.0,
+        description="Timeout seconds for a single LLM HTTP call",
+    )
+    llm_max_retries: int = Field(
+        default=2,
+        description="Retries for transient LLM errors (429, timeout, parse fail)",
+    )
+
     max_history_messages: int = Field(
         default=24,
         description="Max non-system messages in agent history (0 = unlimited)",
@@ -52,22 +59,24 @@ class Settings(BaseSettings):
         default=2500,
         description="Max chars per tool result in LLM context",
     )
-    # minimal | standard | rich  (default standard; rich is opt-in)
+    # Whole user turn (all tool rounds) wall clock
+    chat_timeout_sec: float = Field(
+        default=120.0,
+        description="Max seconds for one user chat turn (0 = unlimited)",
+    )
+
     bootstrap_mode: str = Field(
         default="standard",
         description="Startup guidance: minimal | standard | rich",
     )
-    # Live get_documentation summary (ignored in minimal mode)
     bootstrap_docs: bool = Field(
         default=True,
         description="Load a short live Ordo docs summary after login",
     )
-    # Override path to fixed playbook (default: prompts/bootstrap.md)
     bootstrap_playbook_path: str = Field(
         default="",
         description="Optional path to playbook markdown (empty = prompts/bootstrap.md)",
     )
-    # Project-specific notes (only used when bootstrap_mode = rich)
     bootstrap_extra_md: str = Field(
         default="",
         description="Optional extra markdown for rich mode (project guidance)",

@@ -75,6 +75,8 @@ async def run_bot(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         model=settings.llm_model,
+        timeout_sec=settings.llm_timeout_sec,
+        max_retries=settings.llm_max_retries,
     )
 
     playbook = (
@@ -97,14 +99,16 @@ async def run_bot(
         bootstrap_docs=settings.bootstrap_docs,
         bootstrap_playbook_path=playbook,
         bootstrap_extra_md=extra,
+        chat_timeout_sec=settings.chat_timeout_sec,
     )
     log.info("LLM ready: %s @ %s", settings.llm_model, settings.llm_base_url)
     log.info(
-        "Agent history_cap=%s tool_result_max=%s bootstrap_mode=%s docs=%s",
+        "Timeouts: llm=%ss chat=%ss retries=%s | history_cap=%s mode=%s",
+        settings.llm_timeout_sec,
+        settings.chat_timeout_sec,
+        settings.llm_max_retries,
         settings.max_history_messages,
-        settings.tool_result_max_chars,
         settings.bootstrap_mode,
-        settings.bootstrap_docs,
     )
 
     frontend = FrontendServer(

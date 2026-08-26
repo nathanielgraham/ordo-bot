@@ -1,14 +1,14 @@
 """
 Agent brain for ordo-bot.
 
-- Holds conversation history (capped, configurable)
-- Read-only tools by default; write tools when the user asks to change state
-- Startup guidance: fixed playbook (prompts/bootstrap.md) + optional live docs
+- Capped history, read-only tools by default, bootstrap playbook
+- Per-chat wall-clock deadline so prompts cannot hang forever
 - Ordo broadcasts never enter this history (frontend-only)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -33,10 +33,11 @@ Do not invent ids or states. Prefer compact summaries over raw dumps.
 
 MAX_TOOL_ROUNDS = 5
 DEFAULT_MAX_HISTORY_MESSAGES = 24
+# Whole user turn (all tool rounds + LLM calls) must finish within this many seconds
+DEFAULT_CHAT_TIMEOUT_SEC = 120.0
 
-# Repo layout: prompts/ next to package or cwd
+
 def _default_playbook_path() -> Path:
-    # ordo_bot/agent.py → repo root / prompts / bootstrap.md
     here = Path(__file__).resolve().parent
     candidates = [
         here.parent / "prompts" / "bootstrap.md",
@@ -64,14 +65,7 @@ def _read_text_file(path: Path, *, label: str) -> Optional[str]:
 
 
 class Agent:
-    """
-    Conversational agent with optional Ordo tools.
-
-    bootstrap_mode:
-      minimal  — system prompt only (no playbook file, no live docs)
-      standard — fixed prompts/bootstrap.md (+ live docs if bootstrap_docs)
-      rich     — standard + optional bootstrap_extra_md (project notes)
-    """
+    """Conversational agent with optional Ordo tools and hang safeguards."""
 
     def __init__(
         self,
@@ -85,6 +79,7 @@ class Agent:
         bootstrap_docs: bool = True,
         bootstrap_playbook_path: Optional[Path] = None,
         bootstrap_extra_md: Optional[Path] = None,
+        chat_timeout_sec: float = DEFAULT_CHAT_TIMEOUT_SEC,
     ) -> None:
         self.llm = llm
         self.ordo = ordo
@@ -96,10 +91,10 @@ class Agent:
             log.warning("Unknown bootstrap_mode=%r; using standard", bootstrap_mode)
             mode = "standard"
         self.bootstrap_mode = mode
-        # Live docs only in standard/rich unless explicitly disabled
         self.bootstrap_docs = bool(bootstrap_docs) and mode != "minimal"
         self.bootstrap_playbook_path = bootstrap_playbook_path or _default_playbook_path()
         self.bootstrap_extra_md = bootstrap_extra_md
+        self.chat_timeout_sec = chat_timeout_sec
         self._bootstrapped = False
         self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -114,13 +109,9 @@ class Agent:
         )
 
     async def bootstrap(self) -> None:
-        """
-        Once after Ordo login (or first chat): inject playbook / optional extras / live docs.
-        """
         if self._bootstrapped:
             return
 
-        # --- Fixed playbook (standard + rich) ---
         if self.bootstrap_mode in {"standard", "rich"}:
             playbook = _read_text_file(
                 Path(self.bootstrap_playbook_path), label="bootstrap playbook"
@@ -136,7 +127,6 @@ class Agent:
                     len(playbook),
                 )
 
-        # --- Optional project-specific notes (rich only) ---
         if self.bootstrap_mode == "rich" and self.bootstrap_extra_md:
             extra_path = Path(self.bootstrap_extra_md)
             extra = _read_text_file(extra_path, label="bootstrap_extra_md")
@@ -151,7 +141,6 @@ class Agent:
                     len(extra),
                 )
 
-        # --- Live Ordo docs summary (standard + rich if enabled) ---
         if self.bootstrap_docs and self.ordo and self.ordo.is_logged_in:
             log.info("Bootstrapping with get_documentation(summary)")
             try:
@@ -174,10 +163,33 @@ class Agent:
         log.info("Bootstrap complete (mode=%s)", self.bootstrap_mode)
 
     async def handle_chat(self, user_text: str) -> str:
+        """
+        Handle one user message under a wall-clock deadline.
+        """
         user_text = user_text.strip()
         if not user_text:
             return ""
 
+        timeout = self.chat_timeout_sec
+        if timeout and timeout > 0:
+            try:
+                return await asyncio.wait_for(
+                    self._handle_chat_inner(user_text),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                log.error("Chat timed out after %ss", timeout)
+                # Drop incomplete trailing user message if still last
+                if self.messages and self.messages[-1].get("role") == "user":
+                    if self.messages[-1].get("content") == user_text:
+                        self.messages.pop()
+                return (
+                    f"(timed out after {int(timeout)}s — try a narrower question, "
+                    "or type reset to clear history)"
+                )
+        return await self._handle_chat_inner(user_text)
+
+    async def _handle_chat_inner(self, user_text: str) -> str:
         if not self._bootstrapped:
             await self.bootstrap()
 
