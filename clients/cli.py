@@ -8,6 +8,7 @@ Usage (bot must already be running):
 
     python clients/cli.py
     python clients/cli.py --url ws://127.0.0.1:8765
+    python clients/cli.py --verbose          # one-line Ordo event summaries
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import argparse
 import asyncio
 import json
 import sys
+from typing import Any, Dict, List
 
 try:
     import websockets
@@ -24,7 +26,42 @@ except ImportError:
     sys.exit(1)
 
 
-async def run(url: str) -> None:
+def summarize_ordo_event(data: Dict[str, Any]) -> str:
+    """
+    Turn a full ordo_event payload into one short line.
+
+    Examples:
+      [ordo] jobs_changed: panthero-stats → complete
+      [ordo] clusters_changed: Monitoring → running
+      [ordo] servers_changed: panthero
+    """
+    event = data.get("event") or "?"
+    payload = data.get("data") or {}
+
+    # Prefer the nested broadcast payload if present
+    updates: List[dict] = payload.get("updates") or []
+    names: List[str] = []
+    states: List[str] = []
+
+    for u in updates[:3]:  # at most a few names
+        name = u.get("name")
+        state = u.get("jobstate")
+        if name:
+            names.append(str(name))
+        if state:
+            states.append(str(state))
+
+    if names and states and len(names) == 1 and len(states) == 1:
+        return f"[ordo] {event}: {names[0]} → {states[0]}"
+    if names and states:
+        parts = [f"{n}→{s}" for n, s in zip(names, states)]
+        return f"[ordo] {event}: {', '.join(parts)}"
+    if names:
+        return f"[ordo] {event}: {', '.join(names)}"
+    return f"[ordo] {event}"
+
+
+async def run(url: str, verbose: bool = False) -> None:
     print(f"Connecting to {url} ...")
     async with websockets.connect(url) as ws:
         # First message should be a status
@@ -58,7 +95,7 @@ async def run(url: str) -> None:
             # Send chat message
             await ws.send(json.dumps({"type": "chat", "content": user_text}))
 
-            # Wait for reply (message or error)
+            # Wait for reply (message or error). Ordo events may arrive in between.
             while True:
                 raw = await ws.recv()
                 try:
@@ -77,13 +114,15 @@ async def run(url: str) -> None:
                     print()
                     break
                 if msg_type == "ordo_event":
-                    # Just show it and keep waiting for the chat reply
-                    print(f"[ordo event] {data.get('event')}: {data.get('data')}")
+                    # Quiet by default; one-line summary with --verbose
+                    if verbose:
+                        print(summarize_ordo_event(data))
                     continue
                 if msg_type == "status":
                     continue
-                # Unknown – print and keep going
-                print(f"[recv] {data}")
+                # Unknown – only show when verbose
+                if verbose:
+                    print(f"[recv] {data}")
 
 
 def main() -> None:
@@ -93,9 +132,15 @@ def main() -> None:
         default="ws://127.0.0.1:8765",
         help="Frontend WebSocket URL (default: ws://127.0.0.1:8765)",
     )
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show one-line summaries of Ordo events (jobs_changed, etc.)",
+    )
     args = p.parse_args()
     try:
-        asyncio.run(run(args.url))
+        asyncio.run(run(args.url, verbose=args.verbose))
     except ConnectionRefusedError:
         print(
             f"Could not connect to {args.url}. Is ordo-bot running?",
