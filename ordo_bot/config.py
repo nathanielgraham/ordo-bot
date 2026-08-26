@@ -47,8 +47,11 @@ class Settings(BaseSettings):
         description="Timeout seconds for a single LLM HTTP call",
     )
     llm_max_retries: int = Field(
-        default=2,
-        description="Retries for transient LLM errors (429, timeout, parse fail)",
+        default=0,
+        description=(
+            "Extra LLM attempts after the first failure (0 = fail immediately; "
+            "user/agent can retry). Only used for transient errors if > 0."
+        ),
     )
 
     max_history_messages: int = Field(
@@ -59,7 +62,6 @@ class Settings(BaseSettings):
         default=2500,
         description="Max chars per tool result in LLM context",
     )
-    # Whole user turn (all tool rounds) wall clock
     chat_timeout_sec: float = Field(
         default=120.0,
         description="Max seconds for one user chat turn (0 = unlimited)",
