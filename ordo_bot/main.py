@@ -56,7 +56,7 @@ async def run_bot(settings, smoke: bool = False) -> None:
             "No Ordo token configured. "
             "Set ordo_token in config.toml or the ORDO_BOT_ORDO_TOKEN environment variable."
         )
-        sys.exit(1)
+        raise RuntimeError("Missing Ordo token")
 
     client = OrdoClient(
         url=settings.ordo_ws_url,
@@ -157,6 +157,14 @@ def main() -> None:
     )
     log.info("Ordo URL: %s", settings.ordo_ws_url)
 
+    # Fail fast if the token is missing (before starting the event loop)
+    if not settings.ordo_token:
+        log.error(
+            "No Ordo token configured. "
+            "Set ordo_token in config.toml or the ORDO_BOT_ORDO_TOKEN environment variable."
+        )
+        sys.exit(1)
+
     # ------------------------------------------------------------------
     # Run the async bot and handle Ctrl-C cleanly
     # ------------------------------------------------------------------
@@ -181,6 +189,10 @@ def main() -> None:
         loop.run_until_complete(main_task)
     except asyncio.CancelledError:
         pass
+    except RuntimeError as e:
+        # e.g. missing token raised from inside run_bot (belt-and-suspenders)
+        log.error("%s", e)
+        sys.exit(1)
     finally:
         loop.close()
 
