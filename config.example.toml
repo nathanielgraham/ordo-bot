@@ -1,0 +1,30 @@
+# Example configuration for ordo-bot
+# Copy this file to config.toml and edit the values.
+
+# ------------------------------------------------------------------
+# Ordo connection
+# ------------------------------------------------------------------
+ordo_ws_url = "ws://localhost:8080/ws"   # change to your Ordo WebSocket URL
+ordo_username = "your_username"
+ordo_password = "your_password"
+
+# ------------------------------------------------------------------
+# LLM (OpenAI-compatible endpoint)
+# ------------------------------------------------------------------
+# Default is local Ollama. Change these when you want to use
+# Groq, OpenRouter, xAI, etc.
+llm_base_url = "http://localhost:11434/v1"
+llm_api_key = "ollama"                   # Ollama ignores the key
+llm_model = "llama3.2"
+
+# ------------------------------------------------------------------
+# Frontend WebSocket server
+# (this is the port the CLI / web UI will connect to)
+# ------------------------------------------------------------------
+frontend_host = "127.0.0.1"
+frontend_port = 8765
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+log_level = "INFO"
