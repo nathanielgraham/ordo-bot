@@ -28,9 +28,10 @@ You are ordo-bot, an assistant for the Ordo job scheduler.
 You use tools against a live Ordo instance. Follow any bootstrapped playbook.
 Do not invent ids or states. Prefer compact summaries over raw dumps.
 
-When the user asks to be notified when something finishes, after start_cluster
-or start_job call watch_cluster or watch_job with the numeric id. Completion
-notifications arrive later via Ordo WebSocket broadcasts (not by polling).
+When the user asks to be notified when something finishes:
+  1) start_cluster or start_job
+  2) watch_cluster / watch_job (or watch_event) with the numeric id
+Notifications arrive later via Ordo WebSocket broadcasts (not polling).
 """
 
 MAX_TOOL_ROUNDS = 5
@@ -53,9 +54,7 @@ def _default_playbook_path() -> Path:
 def _read_text_file(path: Path, *, label: str) -> Optional[str]:
     try:
         text = path.read_text(encoding="utf-8").strip()
-        if not text:
-            return None
-        return text
+        return text or None
     except OSError as e:
         log.warning("Could not read %s (%s): %s", label, path, e)
         return None
@@ -108,7 +107,7 @@ class Agent:
 
         if self.bootstrap_mode in {"standard", "rich"}:
             playbook = _read_text_file(
-                Path(self.bootstrap_playbook_path), label="bootstrap playbook"
+                Path(self.bootstrap_playbook_path), label="playbook"
             )
             if playbook:
                 self._inject_system(
@@ -118,7 +117,7 @@ class Agent:
 
         if self.bootstrap_mode == "rich" and self.bootstrap_extra_md:
             extra = _read_text_file(
-                Path(self.bootstrap_extra_md), label="bootstrap_extra_md"
+                Path(self.bootstrap_extra_md), label="extra"
             )
             if extra:
                 self._inject_system("Project-specific guidance:", extra)
@@ -158,7 +157,6 @@ class Agent:
                         timeout=timeout,
                     )
                 except asyncio.TimeoutError:
-                    log.error("Chat timed out after %ss", timeout)
                     if self.messages and self.messages[-1].get("role") == "user":
                         if self.messages[-1].get("content") == user_text:
                             self.messages.pop()
@@ -171,19 +169,41 @@ class Agent:
             self._current_client = None
 
     def _run_local_tool(self, name: str, args: Dict[str, Any]) -> str:
+        if name == "watch_event":
+            event = str(args.get("event") or "*").strip()
+            filt = args.get("filter") or {}
+            if not isinstance(filt, dict):
+                filt = {}
+            # Allow top-level id/name/jobstate as shorthand into filter
+            for k in ("id", "name", "jobstate"):
+                if k in args and args[k] is not None and k not in filt:
+                    filt[k] = args[k]
+            once = args.get("once", True)
+            if isinstance(once, str):
+                once = once.lower() not in {"false", "0", "no"}
+            result = self.watches.add_event(
+                event=event,
+                filter=filt,
+                label=str(args.get("label") or ""),
+                once=bool(once),
+                client=self._current_client,
+            )
+            return json.dumps(result)
+
         if name in {"watch_cluster", "watch_job"}:
             kind = "cluster" if name == "watch_cluster" else "job"
             try:
                 oid = int(args.get("id"))
             except (TypeError, ValueError):
                 return json.dumps({"error": "id must be an integer"})
-            result = self.watches.add(
+            result = self.watches.add_kind(
                 kind=kind,
                 id=oid,
-                client=self._current_client,
                 label=str(args.get("label") or ""),
+                client=self._current_client,
             )
             return json.dumps(result)
+
         return json.dumps({"error": f"Unknown local tool: {name}"})
 
     def _finalize_from_tools(self) -> str:
@@ -211,10 +231,16 @@ class Agent:
 
         self.messages.append({"role": "user", "content": user_text})
 
-        # Notify/watch counts as needing write tools available (start+watch)
         allow_write = user_wants_write(user_text) or any(
             w in user_text.lower()
-            for w in ("notify", "when it", "when finished", "when complete", "let me know")
+            for w in (
+                "notify",
+                "when it",
+                "when finished",
+                "when complete",
+                "let me know",
+                "watch",
+            )
         )
         tools = None
         if self.ordo and self.ordo.is_logged_in:
@@ -314,7 +340,7 @@ class Agent:
 
     def _trim_history(self) -> None:
         cap = self.max_history_messages
-        if cap is None or cap <= 0:
+        if not cap or cap <= 0:
             return
         system = [m for m in self.messages if m.get("role") == "system"]
         rest = [m for m in self.messages if m.get("role") != "system"]

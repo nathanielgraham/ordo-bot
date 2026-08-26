@@ -38,24 +38,24 @@ def _fn(
 _ID = {"type": "integer", "description": "Numeric id"}
 _NAME = {
     "type": "string",
-    "description": "Cluster name or path (e.g. /root, /root/ops, Monitoring)",
+    "description": "Cluster name or path (e.g. /root, Monitoring)",
 }
 
 READ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn(
         "get_documentation",
-        "Fetch Ordo documentation. Prefer format=summary and section=api or overview.",
+        "Fetch Ordo documentation. Prefer format=summary.",
         {
-            "section": {"type": "string", "description": "Doc section"},
-            "format": {"type": "string", "description": "markdown or summary"},
+            "section": {"type": "string"},
+            "format": {"type": "string"},
         },
         ["section"],
     ),
-    _fn("read_org", "Org / account info for the logged-in user.", {}),
+    _fn("read_org", "Org / account info.", {}),
     _fn("read_user", "Current user profile.", {}),
     _fn(
         "find_cluster",
-        "Look up clusters by path or name. Pass path/name in 'name' (not only 'path').",
+        "Look up clusters by path or name. Use argument 'name' (path is an alias).",
         {
             "name": _NAME,
             "path": {"type": "string", "description": "Alias for name"},
@@ -71,23 +71,49 @@ READ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn("read_log", "Read log output for a job id.", {"id": _ID}, ["id"]),
     _fn("sync", "Reconcile scheduler with server processes.", {}),
     _fn(
+        "watch_event",
+        "Generic: notify when an Ordo broadcast matches. "
+        "event e.g. jobs_changed, clusters_changed, or *. "
+        "filter is an object matched against each update (id, name, jobstate). "
+        "jobstate may be a string, list, or the special value 'terminal'. "
+        "once=true (default) removes the watch after the first match.",
+        {
+            "event": {
+                "type": "string",
+                "description": "Broadcast name (jobs_changed, clusters_changed, *)",
+            },
+            "filter": {
+                "type": "object",
+                "description": "Equality filters on update objects (id, name, jobstate, ...)",
+            },
+            "id": {"type": "integer", "description": "Shorthand → filter.id"},
+            "name": {"type": "string", "description": "Shorthand → filter.name"},
+            "jobstate": {
+                "type": "string",
+                "description": "Shorthand → filter.jobstate (or 'terminal')",
+            },
+            "label": {"type": "string"},
+            "once": {"type": "boolean", "description": "Default true"},
+        },
+        ["event"],
+    ),
+    _fn(
         "watch_cluster",
-        "Notify the user when this cluster reaches a terminal state (complete/failed/...). "
-        "Uses Ordo WebSocket broadcasts. Call AFTER start_cluster when the user asks to be "
-        "told when it finishes. Pass numeric cluster id.",
+        "Sugar for watch_event on clusters_changed with id + terminal jobstate. "
+        "Call after start_cluster when the user wants a completion notice.",
         {
             "id": _ID,
-            "label": {"type": "string", "description": "Optional display name"},
+            "label": {"type": "string"},
         },
         ["id"],
     ),
     _fn(
         "watch_job",
-        "Notify the user when this job reaches a terminal state. Uses Ordo broadcasts. "
-        "Call AFTER start_job when the user wants a completion notice.",
+        "Sugar for watch_event on jobs_changed with id + terminal jobstate. "
+        "Call after start_job when the user wants a completion notice.",
         {
             "id": _ID,
-            "label": {"type": "string", "description": "Optional display name"},
+            "label": {"type": "string"},
         },
         ["id"],
     ),
@@ -113,7 +139,12 @@ WRITE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn(
         "create_cluster",
         "WRITE: create cluster.",
-        {"name": {"type": "string"}, "parent_id": {"type": "integer"}, "description": {"type": "string"}, "cal_id": {"type": "integer"}},
+        {
+            "name": {"type": "string"},
+            "parent_id": {"type": "integer"},
+            "description": {"type": "string"},
+            "cal_id": {"type": "integer"},
+        },
         ["name"],
     ),
     _fn(
@@ -133,7 +164,11 @@ WRITE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn(
         "create_cal",
         "WRITE: create calendar.",
-        {"name": {"type": "string"}, "tz": {"type": "string"}, "description": {"type": "string"}},
+        {
+            "name": {"type": "string"},
+            "tz": {"type": "string"},
+            "description": {"type": "string"},
+        },
         ["name", "tz"],
     ),
     _fn(
@@ -145,13 +180,27 @@ WRITE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn(
         "update_cluster",
         "WRITE: update cluster fields.",
-        {"id": _ID, "newname": {"type": "string"}, "description": {"type": "string"}, "cal_id": {"type": "integer"}, "auto_start": {"type": "boolean"}},
+        {
+            "id": _ID,
+            "newname": {"type": "string"},
+            "description": {"type": "string"},
+            "cal_id": {"type": "integer"},
+            "auto_start": {"type": "boolean"},
+        },
         ["id"],
     ),
     _fn(
         "update_job_config",
         "WRITE: update job config.",
-        {"id": _ID, "newname": {"type": "string"}, "script": {"type": "string"}, "server_id": {"type": "integer"}, "description": {"type": "string"}, "retrys": {"type": "integer"}, "delay": {"type": "integer"}},
+        {
+            "id": _ID,
+            "newname": {"type": "string"},
+            "script": {"type": "string"},
+            "server_id": {"type": "integer"},
+            "description": {"type": "string"},
+            "retrys": {"type": "integer"},
+            "delay": {"type": "integer"},
+        },
         ["id"],
     ),
     _fn("delete_job", "WRITE: delete job by id.", {"id": _ID}, ["id"]),
@@ -164,7 +213,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = READ_TOOL_SCHEMAS + WRITE_TOOL_SCHEMAS
 
 READ_TOOL_NAMES: Set[str] = {t["function"]["name"] for t in READ_TOOL_SCHEMAS}
 WRITE_TOOL_NAMES: Set[str] = {t["function"]["name"] for t in WRITE_TOOL_SCHEMAS}
-LOCAL_TOOL_NAMES: Set[str] = {"watch_cluster", "watch_job"}
+LOCAL_TOOL_NAMES: Set[str] = {"watch_event", "watch_cluster", "watch_job"}
 
 _WRITE_HINTS = (
     "start", "stop", "kill", "hold", "release", "ice", "melt",
