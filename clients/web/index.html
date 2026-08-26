@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ordo-bot</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --border: #2d3a4d;
+      --text: #e7ecf3;
+      --muted: #8b9bb4;
+      --user: #3d5a80;
+      --bot: #1b4332;
+      --sys: transparent;
+      --notify: #4a3f2a;
+      --status: #243044;
+      --accent: #5b8def;
+      --danger: #c94c4c;
+      --ok: #3d9a6a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+      padding: 0.75rem 1rem;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-right: 0.5rem;
+    }
+    header input[type="text"] {
+      flex: 1;
+      min-width: 12rem;
+      padding: 0.4rem 0.6rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header button, footer button {
+      padding: 0.4rem 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--status);
+      color: var(--text);
+      cursor: pointer;
+    }
+    header button:hover, footer button:hover { border-color: var(--accent); }
+    header button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    header button:disabled, footer button:disabled, footer input:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    #badge {
+      font-size: 0.8rem;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    #badge.ok { color: var(--ok); }
+    #badge.bad { color: var(--danger); }
+    label.toggle {
+      font-size: 0.8rem;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+      white-space: nowrap;
+    }
+    #log {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+    .msg {
+      max-width: 48rem;
+      padding: 0.55rem 0.75rem;
+      border-radius: 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.4;
+      font-size: 0.95rem;
+    }
+    .msg.user { align-self: flex-end; background: var(--user); }
+    .msg.bot { align-self: flex-start; background: var(--bot); }
+    .msg.notify { align-self: flex-start; background: var(--notify); border-left: 3px solid #c9a227; }
+    .msg.sys, .msg.status {
+      align-self: center;
+      color: var(--muted);
+      font-size: 0.8rem;
+      padding: 0.2rem 0.5rem;
+      background: var(--sys);
+    }
+    .msg.ordo {
+      align-self: flex-start;
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-family: ui-monospace, monospace;
+      background: #121820;
+      border: 1px solid var(--border);
+    }
+    footer {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.75rem 1rem;
+      border-top: 1px solid var(--border);
+      background: var(--panel);
+    }
+    footer input {
+      flex: 1;
+      padding: 0.55rem 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ordo-bot</h1>
+    <input id="url" type="text" spellcheck="false" placeholder="ws://127.0.0.1:8765" />
+    <button id="btnConnect" class="primary" type="button">Connect</button>
+    <button id="btnDisconnect" type="button" disabled>Disconnect</button>
+    <button id="btnReset" type="button" disabled>Reset</button>
+    <label class="toggle"><input id="showEvents" type="checkbox" /> Ordo events</label>
+    <span id="badge" class="bad">disconnected</span>
+  </header>
+  <div id="log" aria-live="polite"></div>
+  <footer>
+    <input id="input" type="text" placeholder="Message…" disabled autocomplete="off" />
+    <button id="btnSend" type="button" disabled>Send</button>
+  </footer>
+
+  <script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const logEl = $("log");
+  const urlEl = $("url");
+  const inputEl = $("input");
+  const badge = $("badge");
+  const showEvents = $("showEvents");
+
+  const STORAGE_URL = "ordo-bot-ws-url";
+  const DEFAULT_URL = "ws://127.0.0.1:8765";
+
+  let ws = null;
+  let autoHelloDone = false;
+  let intentionalClose = false;
+  let reconnectTimer = null;
+
+  urlEl.value = localStorage.getItem(STORAGE_URL) || DEFAULT_URL;
+
+  function setConnected(on) {
+    $("btnConnect").disabled = on;
+    $("btnDisconnect").disabled = !on;
+    $("btnReset").disabled = !on;
+    $("btnSend").disabled = !on;
+    inputEl.disabled = !on;
+    if (on) inputEl.focus();
+  }
+
+  function setBadge(text, ok) {
+    badge.textContent = text;
+    badge.className = ok === true ? "ok" : ok === false ? "bad" : "";
+  }
+
+  function append(kind, text) {
+    const div = document.createElement("div");
+    div.className = "msg " + kind;
+    div.textContent = text;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function send(obj) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(obj));
+  }
+
+  function connect() {
+    const url = (urlEl.value || DEFAULT_URL).trim();
+    localStorage.setItem(STORAGE_URL, url);
+    intentionalClose = false;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (ws) {
+      try { ws.close(); } catch (e) {}
+      ws = null;
+    }
+
+    append("sys", "Connecting to " + url + " …");
+    setBadge("connecting…", false);
+
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      append("sys", "Invalid URL: " + e.message);
+      setBadge("disconnected", false);
+      return;
+    }
+
+    ws.onopen = function () {
+      setConnected(true);
+      setBadge("connected", true);
+      append("sys", "Connected.");
+      if (!autoHelloDone) {
+        autoHelloDone = true;
+        append("user", "hello");
+        send({ type: "chat", content: "hello" });
+      }
+    };
+
+    ws.onmessage = function (ev) {
+      let data;
+      try {
+        data = JSON.parse(ev.data);
+      } catch (e) {
+        append("sys", "(non-JSON) " + ev.data);
+        return;
+      }
+      const t = data.type;
+      if (t === "status") {
+        const oc = data.ordo_connected;
+        const model = data.model || "?";
+        setBadge(
+          (oc ? "Ordo ok" : "Ordo down") + " · " + model,
+          !!oc
+        );
+        append("status", "status: ordo_connected=" + oc + " model=" + model);
+      } else if (t === "ack") {
+        const depth = data.queue_depth || 0;
+        append(
+          "status",
+          depth ? "… received (queued behind " + depth + ")" : "… received"
+        );
+      } else if (t === "progress") {
+        append("status", "… " + (data.content || "processing"));
+      } else if (t === "message") {
+        const content = data.content || "";
+        const isNotify = /^\s*Notification:/i.test(content);
+        append(isNotify ? "notify" : "bot", content);
+      } else if (t === "error") {
+        append("bot", "ERROR: " + (data.message || ""));
+      } else if (t === "ordo_event") {
+        if (showEvents.checked) {
+          const name = data.event || "?";
+          append("ordo", "[ordo] " + name);
+        }
+      } else if (t === "pong") {
+        /* ignore */
+      } else if (showEvents.checked) {
+        append("sys", JSON.stringify(data));
+      }
+    };
+
+    ws.onclose = function () {
+      setConnected(false);
+      setBadge("disconnected", false);
+      append("sys", "Disconnected.");
+      ws = null;
+      if (!intentionalClose) {
+        append("sys", "Reconnecting in 3s…");
+        reconnectTimer = setTimeout(connect, 3000);
+      }
+    };
+
+    ws.onerror = function () {
+      /* onclose will follow */
+    };
+  }
+
+  function disconnect() {
+    intentionalClose = true;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (ws) ws.close();
+  }
+
+  function sendChat() {
+    const text = inputEl.value.trim();
+    if (!text) return;
+    inputEl.value = "";
+    if (text.toLowerCase() === "reset" || text.toLowerCase() === "/reset") {
+      append("user", text);
+      send({ type: "reset" });
+      return;
+    }
+    if (text.toLowerCase() === "quit" || text.toLowerCase() === "exit") {
+      disconnect();
+      return;
+    }
+    append("user", text);
+    send({ type: "chat", content: text });
+  }
+
+  $("btnConnect").onclick = connect;
+  $("btnDisconnect").onclick = disconnect;
+  $("btnReset").onclick = function () {
+    append("user", "reset");
+    send({ type: "reset" });
+  };
+  $("btnSend").onclick = sendChat;
+  inputEl.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      sendChat();
+    }
+  });
+
+  // Auto-connect on load
+  connect();
+})();
+  </script>
+</body>
+</html>
