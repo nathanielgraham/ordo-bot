@@ -10,6 +10,9 @@ Robustness principles (provider-agnostic):
   3. If the HTTP API rejects a completion but the error payload still carries
      a tool-call-shaped JSON blob, recover it and let the agent run the tool.
   4. If the model puts a tool call in plain text content, parse it out.
+  5. Rate limits: short retries only. Do not sleep for multi-minute "try again"
+     windows (daily caps) — that looks like a client hang. Raise so the UI
+     can show the error.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 
@@ -29,6 +32,8 @@ log = logging.getLogger("ordo_bot.llm")
 DEFAULT_LLM_TIMEOUT_SEC = 90.0
 DEFAULT_LLM_RETRIES = 2
 DEFAULT_LLM_RETRY_BACKOFF_SEC = 1.5
+# Never sleep longer than this between retries (avoids "hang" on TPM/TPD messages).
+MAX_RETRY_SLEEP_SEC = 15.0
 
 
 @dataclass
@@ -44,10 +49,6 @@ class ChatResult:
     tool_calls: List[ToolCall] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Generic extraction of tool-call intent from messy text / error bodies
-# ---------------------------------------------------------------------------
-
 def _new_call_id() -> str:
     return f"recovered_{uuid.uuid4().hex[:12]}"
 
@@ -56,7 +57,6 @@ def _args_to_json(arguments: Any) -> str:
     if isinstance(arguments, dict):
         return json.dumps(arguments)
     if isinstance(arguments, str):
-        # already JSON or plain string
         try:
             json.loads(arguments)
             return arguments
@@ -66,14 +66,6 @@ def _args_to_json(arguments: Any) -> str:
 
 
 def tool_calls_from_obj(data: Any) -> List[ToolCall]:
-    """
-    Accept common shapes from any provider / model:
-      {"name": "fn", "arguments": {...}}
-      {"name": "fn", "parameters": {...}}
-      {"tool_calls": [{"function": {"name", "arguments"}}]}
-      {"type": "function", "function": {...}}
-      [ {...}, ... ]
-    """
     calls: List[ToolCall] = []
 
     def add(name: Any, arguments: Any, call_id: Optional[str] = None) -> None:
@@ -120,19 +112,16 @@ def tool_calls_from_obj(data: Any) -> List[ToolCall]:
 
 
 def _extract_json_blobs(text: str) -> List[Any]:
-    """Pull balanced {...} or [...] JSON values out of an arbitrary string."""
     blobs: List[Any] = []
     if not text:
         return blobs
 
-    # Fast path: whole string is JSON
     try:
         blobs.append(json.loads(text))
         return blobs
     except json.JSONDecodeError:
         pass
 
-    # Scan for objects / arrays
     for opener, closer in (("{", "}"), ("[", "]")):
         start = None
         depth = 0
@@ -171,7 +160,6 @@ def _extract_json_blobs(text: str) -> List[Any]:
 
 
 def recover_tool_calls_from_text(text: str) -> List[ToolCall]:
-    """Provider-agnostic: find tool-call-shaped JSON in free text."""
     found: List[ToolCall] = []
     for blob in _extract_json_blobs(text):
         found.extend(tool_calls_from_obj(blob))
@@ -179,7 +167,6 @@ def recover_tool_calls_from_text(text: str) -> List[ToolCall]:
 
 
 def _error_payload_text(exc: BaseException) -> str:
-    """Flatten exception body + message into searchable text."""
     parts: List[str] = [str(exc)]
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
@@ -197,41 +184,89 @@ def _error_payload_text(exc: BaseException) -> str:
 
 
 def recover_tool_calls_from_exception(exc: BaseException) -> List[ToolCall]:
-    """
-    If a provider rejects the HTTP response but still echoes the model's
-    intended tool call somewhere in the error, recover it.
-
-    Works for Groq failed_generation and any API that embeds similar JSON.
-    """
     return recover_tool_calls_from_text(_error_payload_text(exc))
 
 
+def _is_daily_or_quota_exhausted(exc: BaseException) -> bool:
+    """
+    Limits that will not clear in a few seconds — do not retry / long-sleep.
+    """
+    text = _error_payload_text(exc).lower()
+    markers = (
+        "tokens per day",
+        "tpd",
+        "daily",
+        "quota",
+        "billing",
+        "insufficient_quota",
+        "exceeded your current quota",
+    )
+    return any(m in text for m in markers)
+
+
 def _is_retryable(exc: BaseException) -> bool:
+    if _is_daily_or_quota_exhausted(exc):
+        return False
     if isinstance(exc, (APITimeoutError, APIConnectionError, RateLimitError, asyncio.TimeoutError)):
+        # RateLimitError may still be short TPM — allow limited retries unless daily
+        if isinstance(exc, RateLimitError) and _is_daily_or_quota_exhausted(exc):
+            return False
         return True
     if isinstance(exc, APIStatusError):
         if exc.status_code in {408, 429, 500, 502, 503, 504}:
+            if exc.status_code == 429 and _is_daily_or_quota_exhausted(exc):
+                return False
             return True
         msg = str(exc).lower()
         if "rate_limit" in msg or "tokens per minute" in msg:
-            return True
-        # Parse failures: retry once; recovery path runs before retry decision
-        if "output_parse" in msg or "parse" in msg and "tool" in msg:
+            return not _is_daily_or_quota_exhausted(exc)
+        if "output_parse" in msg or ("parse" in msg and "tool" in msg):
             return True
     msg = str(exc).lower()
     if "rate_limit" in msg or "timeout" in msg:
-        return True
+        return not _is_daily_or_quota_exhausted(exc)
     return False
 
 
 def _retry_after_seconds(exc: BaseException, default: float) -> float:
-    m = re.search(r"try again in ([0-9.]+)\s*s", str(exc), re.I)
+    """
+    Honor provider 'try again in Xs' but never sleep longer than MAX_RETRY_SLEEP_SEC.
+    Multi-minute waits make the CLI/web UI look hung.
+    """
+    text = str(exc)
+    m = re.search(r"try again in ([0-9.]+)\s*s", text, re.I)
     if m:
         try:
-            return max(float(m.group(1)), 0.5)
+            sec = float(m.group(1))
+            return max(0.5, min(sec, MAX_RETRY_SLEEP_SEC))
         except ValueError:
             pass
-    return default
+    # "try again in 7m53s" style
+    m = re.search(r"try again in ([0-9]+)\s*m(?:in(?:ute)?s?)?(?:\s*([0-9.]+)\s*s)?", text, re.I)
+    if m:
+        try:
+            mins = int(m.group(1))
+            secs = float(m.group(2) or 0)
+            total = mins * 60 + secs
+            # Cap — caller should usually not retry daily limits at all
+            return max(0.5, min(total, MAX_RETRY_SLEEP_SEC))
+        except ValueError:
+            pass
+    return min(default, MAX_RETRY_SLEEP_SEC)
+
+
+def format_llm_error(exc: BaseException) -> str:
+    """Short user-facing string for rate limits and other LLM failures."""
+    text = _error_payload_text(exc)
+    if _is_daily_or_quota_exhausted(exc) or "rate_limit" in text.lower() or "429" in text:
+        # Prefer provider message if present
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict) and isinstance(err.get("message"), str):
+                return f"LLM rate limit: {err['message']}"
+        return f"LLM rate limit: {exc}"
+    return str(exc)
 
 
 class LLM:
@@ -285,7 +320,6 @@ class LLM:
                     )
                 )
 
-        # Some models put tool intent only in text (no native tool_calls field)
         if not result.tool_calls and content:
             recovered = recover_tool_calls_from_text(content)
             if recovered:
@@ -294,7 +328,6 @@ class LLM:
                     len(recovered),
                 )
                 result.tool_calls = recovered
-                # Avoid showing raw JSON as the user-visible answer
                 result.content = ""
 
         return result
@@ -339,7 +372,6 @@ class LLM:
             except Exception as e:
                 last_exc = e
 
-                # Generic recovery: error body still contains tool-call JSON
                 recovered = recover_tool_calls_from_exception(e)
                 if recovered:
                     log.warning(
@@ -359,10 +391,12 @@ class LLM:
                 if not retryable or attempt >= attempts:
                     break
                 delay = _retry_after_seconds(e, self.retry_backoff_sec * attempt)
+                log.info("Retrying LLM chat in %.1fs", delay)
                 await asyncio.sleep(delay)
 
         assert last_exc is not None
-        raise last_exc
+        # Re-raise with a clearer message for the agent/UI
+        raise RuntimeError(format_llm_error(last_exc)) from last_exc
 
     async def chat_stream(
         self,
