@@ -69,7 +69,8 @@ def summarize_ordo_event(data: Dict[str, Any]) -> str:
 
 async def run(url: str, verbose: bool = False) -> None:
     print(f"Connecting to {url} ...")
-    async with websockets.connect(url) as ws:
+    # Long ping timeout so a slow agent reply does not drop us
+    async with websockets.connect(url, ping_interval=30, ping_timeout=120) as ws:
         # First message should be a status
         raw = await ws.recv()
         try:
