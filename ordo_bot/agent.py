@@ -25,13 +25,17 @@ log = logging.getLogger("ordo_bot.agent")
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are ordo-bot, an assistant for the Ordo job scheduler.
-You use tools against a live Ordo instance. Follow any bootstrapped playbook.
-Do not invent ids or states. Prefer compact summaries over raw dumps.
+You use tools against a live Ordo instance. Prefer compact summaries.
+Do not invent ids or states.
 
-When the user asks to be notified when something finishes:
-  1) start_cluster or start_job
-  2) watch_cluster / watch_job (or watch_event) with the numeric id
-Notifications arrive later via Ordo WebSocket broadcasts (not polling).
+Broadcast watches (WebSocket only — never poll):
+- After start_cluster / start_job, if the user wants to know when something
+  reaches a state, call watch_job or watch_cluster (or watch_event).
+- ALWAYS include jobstate in the watch when the user names a state
+  (e.g. jobstate=\"complete\"). A watch with only id fires on the first
+  matching broadcast (often running/ready), which is usually wrong for
+  \"notify when complete\".
+- Example: watch_job(id=13, jobstate=\"complete\", label=\"sleep-b\")
 """
 
 MAX_TOOL_ROUNDS = 5
@@ -174,7 +178,6 @@ class Agent:
             filt = args.get("filter") or {}
             if not isinstance(filt, dict):
                 filt = {}
-            # Allow top-level id/name/jobstate as shorthand into filter
             for k in ("id", "name", "jobstate"):
                 if k in args and args[k] is not None and k not in filt:
                     filt[k] = args[k]
@@ -201,6 +204,7 @@ class Agent:
                 id=oid,
                 label=str(args.get("label") or ""),
                 client=self._current_client,
+                jobstate=args.get("jobstate"),
             )
             return json.dumps(result)
 

@@ -4,15 +4,19 @@ Reference CLI client for ordo-bot.
 
 Fire-and-forget input; redraws you> after bot lines so the prompt returns
 without needing a blank Enter.
+
+Always restores terminal settings on exit so a crash/disconnect does not
+leave the shell with echo off (invisible typing).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 try:
     import readline  # noqa: F401
@@ -20,11 +24,62 @@ except ImportError:
     pass
 
 try:
+    import termios
+    import tty
+except ImportError:
+    termios = None  # type: ignore
+    tty = None  # type: ignore
+
+try:
     import websockets
     from websockets.exceptions import ConnectionClosed
 except ImportError:
     print("Need websockets: pip install websockets", file=sys.stderr)
     sys.exit(1)
+
+# Saved stdin termios attrs (Unix) so we can restore after abnormal exit
+_stdin_attrs: Optional[list] = None
+
+
+def _save_terminal() -> None:
+    global _stdin_attrs
+    if termios is None:
+        return
+    try:
+        if sys.stdin.isatty():
+            _stdin_attrs = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        _stdin_attrs = None
+
+
+def restore_terminal() -> None:
+    """
+    Put the terminal back to a sane cooked/echo mode.
+
+    Cancelling input() mid-read (disconnect, Ctrl-C) can leave echo off or
+    non-canonical mode so the shell no longer shows typed characters.
+    """
+    if termios is None:
+        return
+    try:
+        if not sys.stdin.isatty():
+            return
+        fd = sys.stdin.fileno()
+        if _stdin_attrs is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, _stdin_attrs)
+        else:
+            # Best-effort: turn echo + canonical back on
+            attrs = termios.tcgetattr(fd)
+            attrs[3] |= termios.ECHO | termios.ICANON
+            termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+    except Exception:
+        pass
+    # Newline so the next shell prompt is not glued to mid-line output
+    try:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 def summarize_ordo_event(data: Dict[str, Any]) -> str:
@@ -85,7 +140,6 @@ async def run(url: str, verbose: bool = False) -> None:
 
         disconnect = asyncio.Event()
         stop_reader = asyncio.Event()
-        # True while blocked in input() — so we can re-print you> after bot lines
         at_prompt = asyncio.Event()
 
         async def recv_loop() -> None:
@@ -237,6 +291,10 @@ def main() -> None:
     p.add_argument("--url", default="ws://127.0.0.1:8765")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
+
+    _save_terminal()
+    atexit.register(restore_terminal)
+
     try:
         asyncio.run(run(args.url, verbose=args.verbose))
     except ConnectionRefusedError:
@@ -251,6 +309,8 @@ def main() -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         print()
         sys.exit(0)
+    finally:
+        restore_terminal()
 
 
 if __name__ == "__main__":
