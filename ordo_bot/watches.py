@@ -1,10 +1,13 @@
 """
 Watches driven by Ordo WebSocket broadcasts.
 
-Generic API: watch_event(event, filter)
-Sugar:       watch_cluster / watch_job → terminal jobstate on that id
+We only react to *new* broadcast messages (e.g. jobs_changed / job_updated).
+We do not poll Ordo and we do not treat "already complete" as a special case —
+if the model wants completion only, it puts jobstate in the filter.
 
-Notifications are pushed to the client socket; they never enter LLM history.
+Sugar:
+  watch_job(id)     → event jobs_changed (and aliases), filter {id}
+  watch_cluster(id) → event clusters_changed (and aliases), filter {id}
 """
 
 from __future__ import annotations
@@ -12,37 +15,37 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 log = logging.getLogger("ordo_bot.watches")
 
-_TERMINAL = frozenset(
-    {
-        "complete",
-        "completed",
-        "failed",
-        "error",
-        "killed",
-        "cancelled",
-        "canceled",
-    }
-)
+# Broadcast names Ordo may use (and common aliases)
+_EVENT_ALIASES: Dict[str, Set[str]] = {
+    "jobs_changed": {"jobs_changed", "job_changed", "job_updated", "jobs_updated"},
+    "job_updated": {"jobs_changed", "job_changed", "job_updated", "jobs_updated"},
+    "clusters_changed": {
+        "clusters_changed",
+        "cluster_changed",
+        "cluster_updated",
+        "clusters_updated",
+    },
+    "cluster_updated": {
+        "clusters_changed",
+        "cluster_changed",
+        "cluster_updated",
+        "clusters_updated",
+    },
+}
 
-# Default events when kind sugar is used
-_KIND_EVENTS = {
-    "cluster": ("clusters_changed", "cluster_changed"),
-    "job": ("jobs_changed", "job_changed"),
+_KIND_DEFAULT_EVENT = {
+    "job": "job_updated",
+    "cluster": "cluster_updated",
 }
 
 
 @dataclass
 class Watch:
-    """One registered watch."""
-
-    event: str  # broadcast name, or "*" for any
-    # Simple equality filters applied to each object in data["updates"]
-    # Special keys:
-    #   jobstate: str | list — match exact or any of list; "terminal" = terminal set
+    event: str  # canonical or "*"
     filter: Dict[str, Any] = field(default_factory=dict)
     label: str = ""
     once: bool = True
@@ -50,27 +53,29 @@ class Watch:
     created: float = field(default_factory=time.time)
 
 
-def _as_list(val: Any) -> List[Any]:
-    if val is None:
-        return []
-    if isinstance(val, list):
-        return val
-    return [val]
+def _events_match(watch_event: str, incoming: str) -> bool:
+    if watch_event in ("*", ""):
+        return True
+    if watch_event == incoming:
+        return True
+    group = _EVENT_ALIASES.get(watch_event)
+    if group and incoming in group:
+        return True
+    # Incoming might be the alias key
+    for _canon, aliases in _EVENT_ALIASES.items():
+        if watch_event in aliases and incoming in aliases:
+            return True
+    return False
 
 
 def _field_match(obj: Dict[str, Any], key: str, expected: Any) -> bool:
     actual = obj.get(key)
-    if key in ("jobstate", "state", "status") and expected == "terminal":
-        return str(actual or "").lower() in _TERMINAL or str(actual or "").lower().startswith(
-            "complete"
-        )
-
-    if isinstance(expected, list):
-        exp_norm = [str(x).lower() if key in ("jobstate", "state", "status") else x for x in expected]
-        act = str(actual).lower() if key in ("jobstate", "state", "status") else actual
-        return act in exp_norm
 
     if key in ("jobstate", "state", "status"):
+        # Prefer jobstate, fall back
+        actual = obj.get("jobstate") or obj.get("state") or obj.get("status")
+        if isinstance(expected, list):
+            return str(actual or "").lower() in {str(x).lower() for x in expected}
         return str(actual or "").lower() == str(expected).lower()
 
     if key == "id":
@@ -82,6 +87,9 @@ def _field_match(obj: Dict[str, Any], key: str, expected: Any) -> bool:
     if key == "name":
         return str(actual or "").lower() == str(expected or "").lower()
 
+    if isinstance(expected, list):
+        return actual in expected
+
     return actual == expected
 
 
@@ -90,14 +98,6 @@ def _object_matches(obj: Dict[str, Any], filt: Dict[str, Any]) -> bool:
         return True
     for key, expected in filt.items():
         if expected is None:
-            continue
-        # jobstate filter also checks state/status aliases on the object
-        if key == "jobstate":
-            state_val = obj.get("jobstate") or obj.get("state") or obj.get("status")
-            probe = dict(obj)
-            probe["jobstate"] = state_val
-            if not _field_match(probe, "jobstate", expected):
-                return False
             continue
         if not _field_match(obj, key, expected):
             return False
@@ -119,7 +119,6 @@ class WatchRegistry:
     ) -> Dict[str, Any]:
         event = (event or "*").strip() or "*"
         filt = dict(filter or {})
-        # Normalize id to int when possible
         if "id" in filt and filt["id"] is not None:
             try:
                 filt["id"] = int(filt["id"])
@@ -142,9 +141,9 @@ class WatchRegistry:
             "label": label,
             "once": once,
             "message": (
-                f"Watching event={event} filter={filt}"
-                + (f" ({label})" if label else "")
-                + ". You will be notified when a matching Ordo broadcast arrives."
+                f"Watching broadcasts event={event} filter={filt}. "
+                "Notification will fire when a matching Ordo broadcast arrives "
+                "(not by polling current state)."
             ),
         }
 
@@ -155,13 +154,22 @@ class WatchRegistry:
         id: int,
         label: str = "",
         client: Any = None,
+        jobstate: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Sugar: watch cluster/job id until terminal jobstate."""
+        """
+        Sugar: watch job/cluster id on the usual update broadcasts.
+
+        Does *not* imply terminal state. Pass jobstate="complete" if that is
+        what the user asked for.
+        """
         kind = kind if kind in {"cluster", "job"} else "cluster"
-        event = _KIND_EVENTS[kind][0]
+        event = _KIND_DEFAULT_EVENT[kind]
+        filt: Dict[str, Any] = {"id": int(id)}
+        if jobstate is not None:
+            filt["jobstate"] = jobstate
         return self.add_event(
             event=event,
-            filter={"id": int(id), "jobstate": "terminal"},
+            filter=filt,
             label=label or f"{kind} {id}",
             once=True,
             client=client,
@@ -178,33 +186,23 @@ class WatchRegistry:
         return n
 
     def match_broadcast(self, event: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Only called when a broadcast is received — never polls."""
         if not self._watches:
             return []
 
         updates = data.get("updates") or []
         if not isinstance(updates, list):
             updates = []
-        if not updates and isinstance(data.get("id"), (int, str)):
+        if not updates and data.get("id") is not None:
             updates = [data]
 
         fired: List[Dict[str, Any]] = []
         remaining: List[Watch] = []
 
         for w in self._watches:
-            if w.event not in ("*", event):
-                # Also accept kind sugar events' aliases
-                aliases = {
-                    "clusters_changed": {"cluster_changed", "clusters_changed"},
-                    "jobs_changed": {"job_changed", "jobs_changed"},
-                }
-                ok = False
-                for primary, group in aliases.items():
-                    if w.event in group and event in group:
-                        ok = True
-                        break
-                if not ok:
-                    remaining.append(w)
-                    continue
+            if not _events_match(w.event, event):
+                remaining.append(w)
+                continue
 
             matched_obj: Optional[Dict[str, Any]] = None
             for u in updates:
@@ -228,11 +226,16 @@ class WatchRegistry:
             text = (
                 f"Notification: **{label}**"
                 + (f" (id {uid})" if uid != "" else "")
-                + (f" is now **{state}**" if state else " matched")
-                + f" [{event}]."
+                + (f" → **{state}**" if state else "")
+                + f" [{event}]"
             )
             fired.append({"client": w.client, "text": text, "watch": w})
-            log.info("Watch fired: event=%s filter=%s", event, w.filter)
+            log.info(
+                "Watch fired on broadcast %s filter=%s state=%s",
+                event,
+                w.filter,
+                state,
+            )
             if not w.once:
                 remaining.append(w)
 
