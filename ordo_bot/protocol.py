@@ -1,10 +1,13 @@
 """
-Bot ↔ Client WebSocket protocol (v0.1+)
+Bot ↔ Client WebSocket protocol (v0.2)
 
 Transport: Newline-Delimited JSON (NDJSON).
+
+Client → bot:  chat | ping | reset
+Bot → client:  ack | progress | message | error | ordo_event | status | pong
 """
 
-from typing import Any, Dict, Literal, Union
+from typing import Any, Dict, Literal, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -13,18 +16,17 @@ from pydantic import BaseModel, Field
 # ----------------------------------------------------------------------
 
 class ChatMessage(BaseModel):
-    """User wants to say something to the agent."""
+    """User wants to say something to the agent (queued server-side)."""
     type: Literal["chat"] = "chat"
     content: str = Field(..., description="The text the user typed")
 
 
 class PingMessage(BaseModel):
-    """Simple keep-alive / connectivity check."""
     type: Literal["ping"] = "ping"
 
 
 class ResetMessage(BaseModel):
-    """Clear the agent's conversation history (keep system prompt)."""
+    """Clear agent history and drop pending queued chats (immediate)."""
     type: Literal["reset"] = "reset"
 
 
@@ -35,32 +37,40 @@ ClientMessage = Union[ChatMessage, PingMessage, ResetMessage]
 # Bot → client
 # ----------------------------------------------------------------------
 
+class AckMessage(BaseModel):
+    """Chat was accepted (queued or starting)."""
+    type: Literal["ack"] = "ack"
+    content: str = "received"
+    queue_depth: int = Field(
+        default=0,
+        description="Pending chats ahead of this one (0 = next / in progress)",
+    )
+
+
+class ProgressMessage(BaseModel):
+    """Lightweight status so the UI does not look hung."""
+    type: Literal["progress"] = "progress"
+    content: str = "processing"
+
+
 class AssistantMessage(BaseModel):
-    """A complete reply from the agent."""
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
     content: str
 
 
 class MessageDelta(BaseModel):
-    """Streaming chunk of an assistant reply (future)."""
     type: Literal["message_delta"] = "message_delta"
     content: str
 
 
 class OrdoEventMessage(BaseModel):
-    """
-    Event from Ordo (jobs_changed, etc.).
-
-    Forwarded to UI only — never stored in agent chat history.
-    """
     type: Literal["ordo_event"] = "ordo_event"
     event: str
     data: Dict[str, Any] = Field(default_factory=dict)
 
 
 class StatusMessage(BaseModel):
-    """Current status of the bot."""
     type: Literal["status"] = "status"
     ordo_connected: bool
     model: str
@@ -68,17 +78,17 @@ class StatusMessage(BaseModel):
 
 
 class ErrorMessage(BaseModel):
-    """Something went wrong."""
     type: Literal["error"] = "error"
     message: str
 
 
 class PongMessage(BaseModel):
-    """Reply to a ping."""
     type: Literal["pong"] = "pong"
 
 
 BotMessage = Union[
+    AckMessage,
+    ProgressMessage,
     AssistantMessage,
     MessageDelta,
     OrdoEventMessage,
@@ -89,7 +99,6 @@ BotMessage = Union[
 
 
 def parse_client_message(raw: dict) -> ClientMessage:
-    """Turn a raw dict into a typed ClientMessage."""
     msg_type = raw.get("type")
     if msg_type == "chat":
         return ChatMessage.model_validate(raw)
