@@ -17,18 +17,17 @@ llm_model = "llama3.2"
 # Groq example:
 # llm_base_url = "https://api.groq.com/openai/v1"
 # llm_api_key = "gsk_..."
-# llm_model = "qwen/qwen3.6-27b"
+# llm_model = "openai/gpt-oss-20b"
 
-# Per-call LLM HTTP timeout and retries (429 / timeout / parse fail)
+# Per-call HTTP timeout. Retries default to 0 (fail fast — user retries).
 llm_timeout_sec = 90
-llm_max_retries = 2
+llm_max_retries = 0
 
 # ------------------------------------------------------------------
 # Agent context hygiene / bootstrap
 # ------------------------------------------------------------------
 max_history_messages = 24
 tool_result_max_chars = 2500
-# Whole user turn (tool rounds + LLM). 0 = unlimited.
 chat_timeout_sec = 120
 
 # minimal | standard | rich
