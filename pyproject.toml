@@ -1,0 +1,31 @@
+[project]
+name = "ordo-bot"
+version = "0.1.0"
+description = "Ordo WebSocket agent bot – connect your own LLM to Ordo"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=12.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "litellm>=1.40",
+    "rich>=13.0",
+    "python-dotenv>=1.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+ordo-bot = "ordo_bot.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ordo_bot"]
