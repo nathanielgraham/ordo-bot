@@ -47,13 +47,23 @@ cp config.example.toml config.toml
 ordo-bot --config config.toml
 ```
 
-In another terminal:
+### CLI
 
 ```bash
 source .venv/bin/activate
 python clients/cli.py
-# optional: python clients/cli.py --verbose   # one-line Ordo event summaries
+# optional: python clients/cli.py --verbose
 ```
+
+### Web UI
+
+```bash
+# with ordo-bot already running:
+xdg-open clients/web/index.html   # or open / start on macOS/Windows
+# or: cd clients/web && python3 -m http.server 8080
+```
+
+Opens a simple chat page: connects to `ws://127.0.0.1:8765`, sends **hello** on first connect, supports reset and optional Ordo event lines. Details: [clients/web/README.md](clients/web/README.md).
 
 ### Config sketch
 
@@ -82,6 +92,13 @@ Environment overrides use the `ORDO_BOT_` prefix (e.g. `ORDO_BOT_ORDO_TOKEN`).
 - `quit` — exit
 - Server sends `ack` → `progress` → `message` (and optional notifications from watches)
 - Terminal settings are restored on exit so a disconnect does not leave echo off
+
+## Web client
+
+- Plain HTML/JS (`clients/web/index.html`)
+- Auto-connect + first-load **hello**
+- Quiet ack/progress lines; highlighted `Notification:` messages
+- Reset, reconnect, Ordo-events toggle, URL in `localStorage`
 
 ## Watches (completion / broadcasts)
 
@@ -117,7 +134,11 @@ ordo-bot/
 │   ├── watches.py          # broadcast watches
 │   ├── frontend_server.py  # client WebSocket + chat queue
 │   └── protocol.py         # message models
-├── clients/cli.py
+├── clients/
+│   ├── cli.py
+│   └── web/
+│       ├── index.html
+│       └── README.md
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   └── PROTOCOL.md
