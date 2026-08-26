@@ -79,12 +79,14 @@ class FrontendServer:
 
     async def start(self) -> None:
         """Bind and start accepting connections."""
+        # Long timeouts: agent+tools can take a while; we must still
+        # answer WebSocket pings so the CLI does not disconnect.
         self._server = await websockets.serve(
             self._handle_client,
             self.host,
             self.port,
-            ping_interval=20,
-            ping_timeout=10,
+            ping_interval=30,
+            ping_timeout=120,
         )
         log.info("Frontend WebSocket listening on ws://%s:%s", self.host, self.port)
 
@@ -147,14 +149,21 @@ class FrontendServer:
         )
         await ws.send(json.dumps(status.model_dump()))
 
+        pending: Set[asyncio.Task] = set()
         try:
             async for raw in ws:
-                await self._handle_message(ws, raw)
+                # Run handlers as tasks so the connection can still
+                # process WebSocket pings while the agent is thinking.
+                task = asyncio.create_task(self._handle_message(ws, raw))
+                pending.add(task)
+                task.add_done_callback(pending.discard)
         except websockets.ConnectionClosed:
             pass
         except Exception:
             log.exception("Error handling client %s", peer)
         finally:
+            for task in pending:
+                task.cancel()
             self._clients.discard(ws)
             log.info("Client disconnected: %s", peer)
 
