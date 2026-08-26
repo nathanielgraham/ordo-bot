@@ -8,13 +8,10 @@ This is what runs when the user types:
 Current behaviour:
   1. Load configuration
   2. Connect to Ordo with the API token
-  3. Create the LLM client and a simple Agent
-  4. Optionally run smoke tests or an interactive chat
-  5. Stay running until Ctrl-C
-
-Later:
-  - Frontend WebSocket server (CLI / web UI connect here)
-  - Agent tools that call Ordo commands
+  3. Create the LLM client and Agent
+  4. Start the frontend WebSocket server (for CLI / web UI)
+  5. Optionally run smoke tests or an interactive terminal chat
+  6. Stay running until Ctrl-C
 """
 
 from __future__ import annotations
@@ -29,6 +26,7 @@ from pathlib import Path
 from ordo_bot import __version__
 from ordo_bot.agent import Agent
 from ordo_bot.config import load_settings
+from ordo_bot.frontend_server import FrontendServer
 from ordo_bot.llm import LLM
 from ordo_bot.ordo_client import OrdoClient
 
@@ -44,19 +42,17 @@ def setup_logging(level: str) -> None:
 
 async def interactive_chat(agent: Agent) -> None:
     """
-    Simple terminal chat loop for testing the agent before the
-    frontend WebSocket exists.
+    Simple terminal chat loop (alternative to the WebSocket CLI).
 
     Type a message and press Enter. Type 'quit' or 'exit' to leave.
     """
     log = logging.getLogger("ordo_bot")
     log.info("Interactive chat ready. Type a message (or 'quit' to exit).")
-    print()  # blank line so the prompt is clear
+    print()
 
     loop = asyncio.get_running_loop()
 
     while True:
-        # input() blocks, so run it in a thread so the event loop stays alive
         try:
             user_text = await loop.run_in_executor(None, lambda: input("you> "))
         except (EOFError, KeyboardInterrupt):
@@ -82,11 +78,6 @@ async def run_bot(
 ) -> None:
     """
     Core async loop.
-
-    - Connects to Ordo
-    - Creates LLM + Agent
-    - Optionally runs smoke tests / interactive chat
-    - Then waits until Ctrl-C (unless chat mode already exited)
     """
     log = logging.getLogger("ordo_bot")
 
@@ -96,19 +87,6 @@ async def run_bot(
             "Set ordo_token in config.toml or the ORDO_BOT_ORDO_TOKEN environment variable."
         )
         raise RuntimeError("Missing Ordo token")
-
-    # ------------------------------------------------------------------
-    # Ordo client
-    # ------------------------------------------------------------------
-    ordo = OrdoClient(
-        url=settings.ordo_ws_url,
-        token=settings.ordo_token,
-    )
-
-    async def on_ordo_message(data: dict) -> None:
-        log.debug("Ordo message: %s", data)
-
-    ordo.on_message = on_ordo_message
 
     # ------------------------------------------------------------------
     # LLM + Agent
@@ -121,13 +99,48 @@ async def run_bot(
     agent = Agent(llm)
     log.info("LLM ready: %s @ %s", settings.llm_model, settings.llm_base_url)
 
+    # ------------------------------------------------------------------
+    # Frontend WebSocket server (clients connect here)
+    # ------------------------------------------------------------------
+    frontend = FrontendServer(
+        host=settings.frontend_host,
+        port=settings.frontend_port,
+        agent=agent,
+        ordo_connected=False,  # updated after Ordo login
+        model=settings.llm_model,
+    )
+
+    # ------------------------------------------------------------------
+    # Ordo client
+    # ------------------------------------------------------------------
+    ordo = OrdoClient(
+        url=settings.ordo_ws_url,
+        token=settings.ordo_token,
+    )
+
+    async def on_ordo_message(data: dict) -> None:
+        """Forward interesting Ordo events to all frontend clients."""
+        log.debug("Ordo message: %s", data)
+        # Broadcasts look like: {"broadcast": "jobs_changed", ...}
+        broadcast = data.get("broadcast")
+        if broadcast:
+            await frontend.broadcast_ordo_event(broadcast, data)
+
+    ordo.on_message = on_ordo_message
+
     try:
+        # Start frontend first so clients can connect while we log in
+        await frontend.start()
+
         log.info("Connecting to Ordo at %s ...", settings.ordo_ws_url)
         await ordo.connect()
         log.info("Connected and logged in to Ordo")
 
+        frontend.ordo_connected = True
+        await frontend.broadcast_status()
+
         # ------------------------------------------------------------------
-        # Optional Ordo smoke test
+        # Optional smoke tests
         # ------------------------------------------------------------------
         if smoke:
             log.info("Running Ordo smoke test: get_documentation(section='overview')")
@@ -148,7 +161,6 @@ async def run_bot(
             except Exception as e:
                 log.error("Ordo smoke test failed: %s", e)
 
-            # Also poke the LLM once
             log.info("Running LLM smoke test ...")
             try:
                 llm_reply = await agent.handle_chat(
@@ -159,18 +171,20 @@ async def run_bot(
                 log.error("LLM smoke test failed: %s", e)
 
         # ------------------------------------------------------------------
-        # Optional interactive chat (terminal)
+        # Optional interactive terminal chat
         # ------------------------------------------------------------------
         if chat:
             await interactive_chat(agent)
-            # After chat ends we shut down
             return
 
         # ------------------------------------------------------------------
         # Idle until Ctrl-C
-        # Later: start frontend WebSocket server here
         # ------------------------------------------------------------------
-        log.info("Bot is running. Press Ctrl-C to stop.")
+        log.info(
+            "Bot is running. Frontend at ws://%s:%s  (Ctrl-C to stop)",
+            settings.frontend_host,
+            settings.frontend_port,
+        )
         await asyncio.Future()
 
     except asyncio.CancelledError:
@@ -179,7 +193,8 @@ async def run_bot(
         log.error("Fatal error: %s", e)
         raise
     finally:
-        log.info("Closing Ordo connection ...")
+        log.info("Shutting down ...")
+        await frontend.stop()
         await ordo.close()
         log.info("Bye")
 
@@ -224,6 +239,11 @@ def main() -> None:
         "LLM endpoint: %s  (model: %s)", settings.llm_base_url, settings.llm_model
     )
     log.info("Ordo URL: %s", settings.ordo_ws_url)
+    log.info(
+        "Frontend will listen on %s:%s",
+        settings.frontend_host,
+        settings.frontend_port,
+    )
 
     if not settings.ordo_token:
         log.error(
