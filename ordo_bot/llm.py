@@ -1,11 +1,15 @@
 """
 LLM wrapper for ordo-bot.
 
-Talks to any OpenAI-compatible endpoint (Ollama, Groq, OpenRouter, xAI, …)
-using the official `openai` Python SDK.
+OpenAI-compatible chat + tools (Ollama, Groq, OpenRouter, xAI, …).
 
-Includes request timeout, light retries, and recovery for Groq tool_use_failed
-(where the model *did* produce a tool call but the API rejected the frame).
+Robustness principles (provider-agnostic):
+  1. Timeouts and limited retries on transient errors (429/5xx/timeout).
+  2. Never strip tools mid-turn as a "fix" — many models still emit tool
+     calls and APIs then reject with "tool choice is none".
+  3. If the HTTP API rejects a completion but the error payload still carries
+     a tool-call-shaped JSON blob, recover it and let the agent run the tool.
+  4. If the model puts a tool call in plain text content, parse it out.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 
@@ -31,7 +35,7 @@ DEFAULT_LLM_RETRY_BACKOFF_SEC = 1.5
 class ToolCall:
     id: str
     name: str
-    arguments: str  # JSON string from the model
+    arguments: str  # JSON string
 
 
 @dataclass
@@ -40,86 +44,166 @@ class ChatResult:
     tool_calls: List[ToolCall] = field(default_factory=list)
 
 
-def _error_body(exc: BaseException) -> Dict[str, Any]:
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        return body
-    # openai SDK sometimes only puts detail in the message string
-    return {}
+# ---------------------------------------------------------------------------
+# Generic extraction of tool-call intent from messy text / error bodies
+# ---------------------------------------------------------------------------
+
+def _new_call_id() -> str:
+    return f"recovered_{uuid.uuid4().hex[:12]}"
 
 
-def _error_code(exc: BaseException) -> Optional[str]:
-    err = _error_body(exc).get("error")
-    if isinstance(err, dict):
-        return err.get("code")
-    return None
+def _args_to_json(arguments: Any) -> str:
+    if isinstance(arguments, dict):
+        return json.dumps(arguments)
+    if isinstance(arguments, str):
+        # already JSON or plain string
+        try:
+            json.loads(arguments)
+            return arguments
+        except json.JSONDecodeError:
+            return json.dumps({"value": arguments})
+    return "{}"
 
 
-def _failed_generation(exc: BaseException) -> Optional[str]:
-    err = _error_body(exc).get("error")
-    if isinstance(err, dict):
-        fg = err.get("failed_generation")
-        if isinstance(fg, str) and fg.strip():
-            return fg.strip()
-    # Fallback: scrape from stringified exception
-    m = re.search(r"'failed_generation':\s*'((?:\\'|[^'])*)'", str(exc))
-    if m:
-        return m.group(1).encode().decode("unicode_escape")
-    m = re.search(r'"failed_generation":\s*"((?:\\"|[^"])*)"', str(exc))
-    if m:
-        return m.group(1).encode().decode("unicode_escape")
-    return None
-
-
-def _tool_calls_from_failed_generation(raw: str) -> List[ToolCall]:
+def tool_calls_from_obj(data: Any) -> List[ToolCall]:
     """
-    Groq sometimes returns tool intent only inside failed_generation, e.g.
-      {"name": "find_cluster", "arguments": {"path": "/root"}}
-    or an OpenAI-ish tool_calls fragment.
+    Accept common shapes from any provider / model:
+      {"name": "fn", "arguments": {...}}
+      {"name": "fn", "parameters": {...}}
+      {"tool_calls": [{"function": {"name", "arguments"}}]}
+      {"type": "function", "function": {...}}
+      [ {...}, ... ]
     """
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-
     calls: List[ToolCall] = []
 
-    def add(name: str, arguments: Any) -> None:
-        if not name:
+    def add(name: Any, arguments: Any, call_id: Optional[str] = None) -> None:
+        if not isinstance(name, str) or not name.strip():
             return
-        if isinstance(arguments, dict):
-            args_s = json.dumps(arguments)
-        elif isinstance(arguments, str):
-            args_s = arguments
-        else:
-            args_s = "{}"
         calls.append(
             ToolCall(
-                id=f"recovered_{uuid.uuid4().hex[:12]}",
-                name=name,
-                arguments=args_s,
+                id=call_id or _new_call_id(),
+                name=name.strip(),
+                arguments=_args_to_json(arguments),
             )
         )
 
-    if isinstance(data, dict):
-        if "name" in data and ("arguments" in data or "parameters" in data):
-            add(data.get("name") or "", data.get("arguments", data.get("parameters")))
-        elif "tool_calls" in data and isinstance(data["tool_calls"], list):
-            for tc in data["tool_calls"]:
-                if not isinstance(tc, dict):
-                    continue
-                fn = tc.get("function") or tc
-                if isinstance(fn, dict):
-                    add(fn.get("name") or "", fn.get("arguments", {}))
-        elif data.get("type") == "function" and isinstance(data.get("function"), dict):
-            fn = data["function"]
-            add(fn.get("name") or "", fn.get("arguments", {}))
-    elif isinstance(data, list):
+    if isinstance(data, list):
         for item in data:
-            if isinstance(item, dict) and "name" in item:
-                add(item.get("name") or "", item.get("arguments", item.get("parameters")))
+            calls.extend(tool_calls_from_obj(item))
+        return calls
+
+    if not isinstance(data, dict):
+        return calls
+
+    if "tool_calls" in data and isinstance(data["tool_calls"], list):
+        for tc in data["tool_calls"]:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+            add(fn.get("name"), fn.get("arguments", fn.get("parameters")), tc.get("id"))
+        return calls
+
+    if data.get("type") == "function" and isinstance(data.get("function"), dict):
+        fn = data["function"]
+        add(fn.get("name"), fn.get("arguments", fn.get("parameters")), data.get("id"))
+        return calls
+
+    if "name" in data and ("arguments" in data or "parameters" in data or len(data) <= 3):
+        add(
+            data.get("name"),
+            data.get("arguments", data.get("parameters", {})),
+            data.get("id"),
+        )
+        return calls
 
     return calls
+
+
+def _extract_json_blobs(text: str) -> List[Any]:
+    """Pull balanced {...} or [...] JSON values out of an arbitrary string."""
+    blobs: List[Any] = []
+    if not text:
+        return blobs
+
+    # Fast path: whole string is JSON
+    try:
+        blobs.append(json.loads(text))
+        return blobs
+    except json.JSONDecodeError:
+        pass
+
+    # Scan for objects / arrays
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = None
+        depth = 0
+        in_str = False
+        esc = False
+        for i, ch in enumerate(text):
+            if start is None:
+                if ch == opener:
+                    start = i
+                    depth = 1
+                    in_str = False
+                    esc = False
+                continue
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    chunk = text[start : i + 1]
+                    try:
+                        blobs.append(json.loads(chunk))
+                    except json.JSONDecodeError:
+                        pass
+                    start = None
+    return blobs
+
+
+def recover_tool_calls_from_text(text: str) -> List[ToolCall]:
+    """Provider-agnostic: find tool-call-shaped JSON in free text."""
+    found: List[ToolCall] = []
+    for blob in _extract_json_blobs(text):
+        found.extend(tool_calls_from_obj(blob))
+    return found
+
+
+def _error_payload_text(exc: BaseException) -> str:
+    """Flatten exception body + message into searchable text."""
+    parts: List[str] = [str(exc)]
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        try:
+            parts.append(json.dumps(body))
+        except (TypeError, ValueError):
+            parts.append(str(body))
+        err = body.get("error")
+        if isinstance(err, dict):
+            for key in ("failed_generation", "message", "code"):
+                val = err.get(key)
+                if isinstance(val, str):
+                    parts.append(val)
+    return "\n".join(parts)
+
+
+def recover_tool_calls_from_exception(exc: BaseException) -> List[ToolCall]:
+    """
+    If a provider rejects the HTTP response but still echoes the model's
+    intended tool call somewhere in the error, recover it.
+
+    Works for Groq failed_generation and any API that embeds similar JSON.
+    """
+    return recover_tool_calls_from_text(_error_payload_text(exc))
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -128,12 +212,11 @@ def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, APIStatusError):
         if exc.status_code in {408, 429, 500, 502, 503, 504}:
             return True
-        code = _error_code(exc)
-        # tool_use_failed with recoverable generation is handled specially, not retried blindly
-        if code == "output_parse_failed":
-            return True
         msg = str(exc).lower()
         if "rate_limit" in msg or "tokens per minute" in msg:
+            return True
+        # Parse failures: retry once; recovery path runs before retry decision
+        if "output_parse" in msg or "parse" in msg and "tool" in msg:
             return True
     msg = str(exc).lower()
     if "rate_limit" in msg or "timeout" in msg:
@@ -142,7 +225,6 @@ def _is_retryable(exc: BaseException) -> bool:
 
 
 def _retry_after_seconds(exc: BaseException, default: float) -> float:
-    """Parse Groq 'Please try again in 8.25s' if present."""
     m = re.search(r"try again in ([0-9.]+)\s*s", str(exc), re.I)
     if m:
         try:
@@ -189,6 +271,34 @@ class LLM:
             self.max_retries,
         )
 
+    def _result_from_message(self, message: Any) -> ChatResult:
+        content = (message.content or "").strip()
+        result = ChatResult(content=content)
+
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                result.tool_calls.append(
+                    ToolCall(
+                        id=tc.id,
+                        name=tc.function.name,
+                        arguments=tc.function.arguments or "{}",
+                    )
+                )
+
+        # Some models put tool intent only in text (no native tool_calls field)
+        if not result.tool_calls and content:
+            recovered = recover_tool_calls_from_text(content)
+            if recovered:
+                log.info(
+                    "Parsed %d tool call(s) from assistant content text",
+                    len(recovered),
+                )
+                result.tool_calls = recovered
+                # Avoid showing raw JSON as the user-visible answer
+                result.content = ""
+
+        return result
+
     async def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -224,38 +334,19 @@ class LLM:
                     self.model,
                 )
                 response = await self._client.chat.completions.create(**kwargs)
-                message = response.choices[0].message
-
-                result = ChatResult(content=(message.content or "").strip())
-                if message.tool_calls:
-                    for tc in message.tool_calls:
-                        result.tool_calls.append(
-                            ToolCall(
-                                id=tc.id,
-                                name=tc.function.name,
-                                arguments=tc.function.arguments or "{}",
-                            )
-                        )
-                    log.debug("LLM requested %d tool call(s)", len(result.tool_calls))
-                return result
+                return self._result_from_message(response.choices[0].message)
 
             except Exception as e:
                 last_exc = e
 
-                # Groq: model called a tool but API rejected the frame — recover intent
-                code = _error_code(e)
-                fg = _failed_generation(e)
-                if code == "tool_use_failed" or (
-                    fg and "tool_use_failed" in str(e).lower()
-                ):
-                    if fg:
-                        recovered = _tool_calls_from_failed_generation(fg)
-                        if recovered:
-                            log.warning(
-                                "Recovered %d tool call(s) from failed_generation",
-                                len(recovered),
-                            )
-                            return ChatResult(content="", tool_calls=recovered)
+                # Generic recovery: error body still contains tool-call JSON
+                recovered = recover_tool_calls_from_exception(e)
+                if recovered:
+                    log.warning(
+                        "Recovered %d tool call(s) from API error payload",
+                        len(recovered),
+                    )
+                    return ChatResult(content="", tool_calls=recovered)
 
                 retryable = _is_retryable(e)
                 log.warning(
@@ -270,8 +361,6 @@ class LLM:
                 delay = _retry_after_seconds(e, self.retry_backoff_sec * attempt)
                 await asyncio.sleep(delay)
 
-        # Do NOT retry with tools stripped when history expects tool calling:
-        # gpt-oss on Groq often emits tools anyway → "Tool choice is none, but model called a tool".
         assert last_exc is not None
         raise last_exc
 

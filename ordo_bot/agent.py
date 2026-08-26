@@ -2,8 +2,8 @@
 Agent brain for ordo-bot.
 
 - Capped history, read-only tools by default, bootstrap playbook
-- Per-chat wall-clock deadline so prompts cannot hang forever
-- Ordo broadcasts never enter this history (frontend-only)
+- Per-chat wall-clock deadline
+- Does not strip tools mid-loop (avoids "tool choice is none" class errors)
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ Do not invent ids or states. Prefer compact summaries over raw dumps.
 
 MAX_TOOL_ROUNDS = 5
 DEFAULT_MAX_HISTORY_MESSAGES = 24
-# Whole user turn (all tool rounds + LLM calls) must finish within this many seconds
 DEFAULT_CHAT_TIMEOUT_SEC = 120.0
 
 
@@ -163,9 +162,6 @@ class Agent:
         log.info("Bootstrap complete (mode=%s)", self.bootstrap_mode)
 
     async def handle_chat(self, user_text: str) -> str:
-        """
-        Handle one user message under a wall-clock deadline.
-        """
         user_text = user_text.strip()
         if not user_text:
             return ""
@@ -179,7 +175,6 @@ class Agent:
                 )
             except asyncio.TimeoutError:
                 log.error("Chat timed out after %ss", timeout)
-                # Drop incomplete trailing user message if still last
                 if self.messages and self.messages[-1].get("role") == "user":
                     if self.messages[-1].get("content") == user_text:
                         self.messages.pop()
@@ -188,6 +183,30 @@ class Agent:
                     "or type reset to clear history)"
                 )
         return await self._handle_chat_inner(user_text)
+
+    def _finalize_from_tools(self) -> str:
+        """
+        When we hit max tool rounds, do not call the LLM with tools=None
+        (breaks several providers). Summarize last tool payloads instead.
+        """
+        chunks: List[str] = []
+        for msg in reversed(self.messages):
+            if msg.get("role") != "tool":
+                if msg.get("role") == "user":
+                    break
+                continue
+            content = msg.get("content") or ""
+            if content:
+                chunks.append(content[:800])
+            if len(chunks) >= 3:
+                break
+        chunks.reverse()
+        if not chunks:
+            return "(stopped after too many tool calls)"
+        return (
+            "(reached tool-call limit; latest tool data)\n"
+            + "\n---\n".join(chunks)
+        )
 
     async def _handle_chat_inner(self, user_text: str) -> str:
         if not self._bootstrapped:
@@ -278,9 +297,8 @@ class Agent:
                         len(tool_result),
                     )
 
-            log.warning("Hit MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)
-            result = await self.llm.chat(self.messages, tools=None)
-            reply = result.content or "(stopped after too many tool calls)"
+            log.warning("Hit MAX_TOOL_ROUNDS=%d — not calling LLM with tools=None", MAX_TOOL_ROUNDS)
+            reply = self._finalize_from_tools()
             self.messages.append({"role": "assistant", "content": reply})
             self._trim_history()
             return reply
@@ -321,7 +339,6 @@ class Agent:
         )
 
     def reset(self) -> None:
-        """Clear conversation history (keep system prompt). Re-bootstrap next chat."""
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self._bootstrapped = False
         log.info("Conversation history cleared")
