@@ -36,16 +36,12 @@ class Settings(BaseSettings):
     # Ordo connection
     # ------------------------------------------------------------------
     ordo_ws_url: str = Field(
-        default="ws://localhost:8080/ws",
+        default="wss://ordoscheduler.com/websocket",
         description="WebSocket URL of the Ordo instance",
     )
-    ordo_username: str = Field(
+    ordo_token: str = Field(
         default="",
-        description="Username for Ordo login",
-    )
-    ordo_password: str = Field(
-        default="",
-        description="Password for Ordo login",
+        description="API token from Ordo Settings (used for login_user)",
     )
 
     # ------------------------------------------------------------------
