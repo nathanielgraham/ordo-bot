@@ -22,23 +22,18 @@ log = logging.getLogger("ordo_bot.agent")
 DEFAULT_SYSTEM_PROMPT = """\
 You are ordo-bot, an assistant for the Ordo job scheduler.
 
-You can call tools against the live Ordo instance. Available tools:
-  - find_cluster: look up a cluster by name or path
-  - read_cluster: full cluster detail + jobs (by id)
-  - read_job: full job detail (by id)
-  - find_monitor: list servers / monitors
-  - find_cal: list calendars / schedules
-  - get_documentation: fetch Ordo docs for a section
-  - read_org: org / account info
-  - start_cluster: START a cluster by id (write — only if user asks)
+You have tools for the live Ordo WebSocket API, including:
+  Browse: find_cluster, read_cluster, read_job, find_monitor, find_cal, read_cal,
+          find_log, read_log, get_documentation, read_org, read_user, sync
+  Lifecycle: start_cluster/job, kill_*, hold_*, release_*, ice_*, melt_*, complete_*,
+             reset_cluster, clone_cluster
+  Create: create_cluster, create_job, create_cal, create_cron
+  Update/delete: update_cluster, update_job_config, delete_job/cluster/cron/cal
 
-Use tools when the user asks about their real jobs, clusters, or servers.
-Do not invent cluster names or job states — look them up.
-Only call start_cluster when the user clearly asks to start/run a cluster.
-If the user asks what tools you have, list them.
-
-Be helpful, concise, and practical.
-When a tool returns data, summarize the useful parts for the user.
+WRITE tools change the system — only use them when the user clearly asks.
+Do not invent ids or states; look them up.
+create_cron: pass the Quartz expression as "name" and the calendar id as "cal_id".
+Be helpful, concise, and practical. Summarize tool results for the user.
 """
 
 # Safety: don't let a runaway model loop tools forever
@@ -79,14 +74,12 @@ class Agent:
         log.debug("User: %s", user_text[:200])
         self.messages.append({"role": "user", "content": user_text})
 
-        # Tools only if we have a live Ordo connection
         tools = TOOL_SCHEMAS if self.ordo and self.ordo.is_logged_in else None
 
         try:
             for round_num in range(MAX_TOOL_ROUNDS):
                 result = await self.llm.chat(self.messages, tools=tools)
 
-                # No tool calls → final answer
                 if not result.tool_calls:
                     reply = result.content or "(no response)"
                     self.messages.append(
@@ -95,7 +88,6 @@ class Agent:
                     log.debug("Assistant: %s", reply[:200])
                     return reply
 
-                # Model wants tools — record the assistant message with tool_calls
                 assistant_msg: Dict[str, Any] = {
                     "role": "assistant",
                     "content": result.content or None,
@@ -113,7 +105,6 @@ class Agent:
                 }
                 self.messages.append(assistant_msg)
 
-                # Run each tool and append results
                 for tc in result.tool_calls:
                     args = self._parse_args(tc.arguments)
                     if self.ordo is None:
@@ -137,7 +128,6 @@ class Agent:
                         len(tool_result),
                     )
 
-            # Hit max rounds — ask for a final answer without tools
             log.warning("Hit MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)
             result = await self.llm.chat(self.messages, tools=None)
             reply = result.content or "(stopped after too many tool calls)"
@@ -146,7 +136,6 @@ class Agent:
 
         except Exception as e:
             log.error("Agent error: %s", e)
-            # Roll back the user message on hard failure
             if self.messages and self.messages[-1].get("role") == "user":
                 self.messages.pop()
             return f"(error: {e})"
