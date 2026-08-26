@@ -19,6 +19,12 @@ import json
 import sys
 from typing import Any, Dict, List
 
+# Enable up/down arrow command history for input() (Unix / macOS)
+try:
+    import readline  # noqa: F401
+except ImportError:
+    pass  # Windows without pyreadline — arrows won't work, input still fine
+
 try:
     import websockets
 except ImportError:
