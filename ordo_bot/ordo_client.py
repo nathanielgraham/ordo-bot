@@ -242,6 +242,18 @@ class OrdoClient:
             {"command": "find_cluster", "name": name}
         )
 
+    async def read_cluster(self, cluster_id: int) -> Dict[str, Any]:
+        """Read one cluster by id (includes nested jobs)."""
+        return await self.send_command({"command": "read_cluster", "id": cluster_id})
+
+    async def read_job(self, job_id: int) -> Dict[str, Any]:
+        """Read one job by id."""
+        return await self.send_command({"command": "read_job", "id": job_id})
+
+    async def start_cluster(self, cluster_id: int) -> Dict[str, Any]:
+        """Start a cluster by id (WRITE action)."""
+        return await self.send_command({"command": "start_cluster", "id": cluster_id})
+
     # ------------------------------------------------------------------
     # Internal receiver
     # ------------------------------------------------------------------
