@@ -76,18 +76,34 @@ async def run_bot(
         api_key=settings.llm_api_key,
         model=settings.llm_model,
     )
+
+    playbook = (
+        Path(settings.bootstrap_playbook_path)
+        if settings.bootstrap_playbook_path
+        else None
+    )
+    extra = (
+        Path(settings.bootstrap_extra_md)
+        if settings.bootstrap_extra_md
+        else None
+    )
+
     agent = Agent(
         llm,
         ordo=None,
         max_history_messages=settings.max_history_messages,
         tool_result_max_chars=settings.tool_result_max_chars,
+        bootstrap_mode=settings.bootstrap_mode,
         bootstrap_docs=settings.bootstrap_docs,
+        bootstrap_playbook_path=playbook,
+        bootstrap_extra_md=extra,
     )
     log.info("LLM ready: %s @ %s", settings.llm_model, settings.llm_base_url)
     log.info(
-        "Agent history cap=%s tool_result_max_chars=%s bootstrap_docs=%s",
+        "Agent history_cap=%s tool_result_max=%s bootstrap_mode=%s docs=%s",
         settings.max_history_messages,
         settings.tool_result_max_chars,
+        settings.bootstrap_mode,
         settings.bootstrap_docs,
     )
 
@@ -105,7 +121,6 @@ async def run_bot(
     )
 
     async def on_ordo_message(data: dict) -> None:
-        # Forward to UI only — never into agent.messages
         log.debug("Ordo message: %s", data)
         broadcast = data.get("broadcast")
         if broadcast:

@@ -10,7 +10,6 @@ ordo_token = "YOUR_ORDO_API_TOKEN_HERE"
 # ------------------------------------------------------------------
 # LLM (OpenAI-compatible endpoint)
 # ------------------------------------------------------------------
-# Local Ollama:
 llm_base_url = "http://localhost:11434/v1"
 llm_api_key = "ollama"
 llm_model = "llama3.2"
@@ -21,14 +20,24 @@ llm_model = "llama3.2"
 # llm_model = "qwen/qwen3.6-27b"
 
 # ------------------------------------------------------------------
-# Agent context hygiene (helps free-tier TPM limits)
+# Agent context hygiene / bootstrap
 # ------------------------------------------------------------------
 # Max non-system messages kept in history. 0 = unlimited (large models).
 max_history_messages = 24
 # Max characters of each tool result stored for the LLM.
 tool_result_max_chars = 2500
-# Load a short Ordo docs summary after login.
+
+# Startup guidance:
+#   minimal  — short system prompt only (tight TPM / tiny models)
+#   standard — fixed prompts/bootstrap.md + optional live docs (default)
+#   rich     — standard + optional project markdown (opt-in)
+bootstrap_mode = "standard"
+# Live get_documentation summary after login (ignored when mode=minimal)
 bootstrap_docs = true
+# Override playbook path (empty = prompts/bootstrap.md)
+# bootstrap_playbook_path = "prompts/bootstrap.md"
+# Project-specific notes (only read when bootstrap_mode = "rich")
+# bootstrap_extra_md = "prompts/project.md"
 
 # ------------------------------------------------------------------
 # Frontend WebSocket server

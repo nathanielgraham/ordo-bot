@@ -2,8 +2,8 @@
 Agent brain for ordo-bot.
 
 - Holds conversation history (capped, configurable)
-- Calls the LLM with read-only tools by default; write tools when asked
-- Bootstraps once with get_documentation(summary) so the model knows Ordo
+- Read-only tools by default; write tools when the user asks to change state
+- Startup guidance: fixed playbook (prompts/bootstrap.md) + optional live docs
 - Ordo broadcasts never enter this history (frontend-only)
 """
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ordo_bot.llm import LLM
@@ -26,34 +27,50 @@ log = logging.getLogger("ordo_bot.agent")
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are ordo-bot, an assistant for the Ordo job scheduler.
-
-You talk to a live Ordo instance via tools.
-
-Default tools are READ-ONLY (browse clusters/jobs, monitors, calendars, logs, docs).
-WRITE tools (start/kill/create/delete/update/...) are only available when the user
-clearly asks to change something. Do not invent ids or states — look them up.
-
-At session start you may receive a short documentation summary; use it.
-Prefer compact answers. When listing trees, use names, ids, and states — not full scripts.
-
-If the user says "reset" about the conversation, they are clearing chat history
-(handled outside tools); do not confuse that with reset_cluster.
+You use tools against a live Ordo instance. Follow any bootstrapped playbook.
+Do not invent ids or states. Prefer compact summaries over raw dumps.
 """
 
 MAX_TOOL_ROUNDS = 5
-
-# 0 = unlimited (larger models / paid tiers may prefer this)
 DEFAULT_MAX_HISTORY_MESSAGES = 24
+
+# Repo layout: prompts/ next to package or cwd
+def _default_playbook_path() -> Path:
+    # ordo_bot/agent.py → repo root / prompts / bootstrap.md
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here.parent / "prompts" / "bootstrap.md",
+        Path.cwd() / "prompts" / "bootstrap.md",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return candidates[0]
+
+
+def _read_text_file(path: Path, *, label: str) -> Optional[str]:
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            log.warning("%s is empty: %s", label, path)
+            return None
+        return text
+    except FileNotFoundError:
+        log.warning("%s not found: %s", label, path)
+        return None
+    except OSError as e:
+        log.warning("Could not read %s (%s): %s", label, path, e)
+        return None
 
 
 class Agent:
     """
     Conversational agent with optional Ordo tools.
 
-    Usage:
-        agent = Agent(llm, ordo=ordo_client, max_history_messages=24)
-        await agent.bootstrap()   # once after Ordo login
-        reply = await agent.handle_chat("Show the Monitoring cluster")
+    bootstrap_mode:
+      minimal  — system prompt only (no playbook file, no live docs)
+      standard — fixed prompts/bootstrap.md (+ live docs if bootstrap_docs)
+      rich     — standard + optional bootstrap_extra_md (project notes)
     """
 
     def __init__(
@@ -64,64 +81,103 @@ class Agent:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_history_messages: int = DEFAULT_MAX_HISTORY_MESSAGES,
         tool_result_max_chars: int = DEFAULT_TOOL_RESULT_MAX_CHARS,
+        bootstrap_mode: str = "standard",
         bootstrap_docs: bool = True,
+        bootstrap_playbook_path: Optional[Path] = None,
+        bootstrap_extra_md: Optional[Path] = None,
     ) -> None:
         self.llm = llm
         self.ordo = ordo
         self.system_prompt = system_prompt
-        # 0 or negative => do not cap
         self.max_history_messages = max_history_messages
         self.tool_result_max_chars = tool_result_max_chars
-        self.bootstrap_docs = bootstrap_docs
+        mode = (bootstrap_mode or "standard").strip().lower()
+        if mode not in {"minimal", "standard", "rich"}:
+            log.warning("Unknown bootstrap_mode=%r; using standard", bootstrap_mode)
+            mode = "standard"
+        self.bootstrap_mode = mode
+        # Live docs only in standard/rich unless explicitly disabled
+        self.bootstrap_docs = bool(bootstrap_docs) and mode != "minimal"
+        self.bootstrap_playbook_path = bootstrap_playbook_path or _default_playbook_path()
+        self.bootstrap_extra_md = bootstrap_extra_md
         self._bootstrapped = False
         self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
         ]
 
+    def _inject_system(self, title: str, body: str) -> None:
+        self.messages.append(
+            {
+                "role": "system",
+                "content": f"{title}\n\n{body}",
+            }
+        )
+
     async def bootstrap(self) -> None:
         """
-        Once after Ordo login: fetch a short docs summary into context.
-
-        Does not count as a user turn. Skipped if already done or no Ordo.
+        Once after Ordo login (or first chat): inject playbook / optional extras / live docs.
         """
-        if self._bootstrapped or not self.bootstrap_docs:
-            return
-        if not self.ordo or not self.ordo.is_logged_in:
+        if self._bootstrapped:
             return
 
-        log.info("Bootstrapping agent with get_documentation(summary)")
-        try:
-            summary = await run_tool(
-                self.ordo,
-                "get_documentation",
-                {"section": "api", "format": "summary"},
-                max_chars=self.tool_result_max_chars,
+        # --- Fixed playbook (standard + rich) ---
+        if self.bootstrap_mode in {"standard", "rich"}:
+            playbook = _read_text_file(
+                Path(self.bootstrap_playbook_path), label="bootstrap playbook"
             )
-            # Inject as a system note so the model knows the surface without a user ask
-            self.messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Ordo API documentation summary (bootstrapped; do not repeat unless asked):\n"
-                        + summary
-                    ),
-                }
-            )
-            self._trim_history()
-            self._bootstrapped = True
-            log.info("Bootstrap docs loaded (%d chars)", len(summary))
-        except Exception as e:
-            log.warning("Bootstrap docs failed: %s", e)
+            if playbook:
+                self._inject_system(
+                    "ordo-bot playbook (fixed; follow unless the user overrides):",
+                    playbook,
+                )
+                log.info(
+                    "Bootstrap playbook loaded from %s (%d chars)",
+                    self.bootstrap_playbook_path,
+                    len(playbook),
+                )
+
+        # --- Optional project-specific notes (rich only) ---
+        if self.bootstrap_mode == "rich" and self.bootstrap_extra_md:
+            extra_path = Path(self.bootstrap_extra_md)
+            extra = _read_text_file(extra_path, label="bootstrap_extra_md")
+            if extra:
+                self._inject_system(
+                    "Project-specific guidance (user-supplied):",
+                    extra,
+                )
+                log.info(
+                    "Bootstrap extra md loaded from %s (%d chars)",
+                    extra_path,
+                    len(extra),
+                )
+
+        # --- Live Ordo docs summary (standard + rich if enabled) ---
+        if self.bootstrap_docs and self.ordo and self.ordo.is_logged_in:
+            log.info("Bootstrapping with get_documentation(summary)")
+            try:
+                summary = await run_tool(
+                    self.ordo,
+                    "get_documentation",
+                    {"section": "api", "format": "summary"},
+                    max_chars=self.tool_result_max_chars,
+                )
+                self._inject_system(
+                    "Ordo API documentation summary (live; do not repeat unless asked):",
+                    summary,
+                )
+                log.info("Bootstrap live docs loaded (%d chars)", len(summary))
+            except Exception as e:
+                log.warning("Bootstrap live docs failed: %s", e)
+
+        self._trim_history()
+        self._bootstrapped = True
+        log.info("Bootstrap complete (mode=%s)", self.bootstrap_mode)
 
     async def handle_chat(self, user_text: str) -> str:
-        """
-        Handle one user message. May run several tool rounds, then return text.
-        """
         user_text = user_text.strip()
         if not user_text:
             return ""
 
-        # Ensure bootstrap once we have Ordo
         if not self._bootstrapped:
             await self.bootstrap()
 
@@ -167,7 +223,6 @@ class Agent:
 
                 for tc in result.tool_calls:
                     args = self._parse_args(tc.arguments)
-                    # Refuse write tools if this turn is read-only
                     if (
                         not allow_write
                         and tc.name
@@ -233,11 +288,6 @@ class Agent:
             return {}
 
     def _trim_history(self) -> None:
-        """
-        Keep system messages + the last N non-system messages.
-
-        max_history_messages <= 0 means unlimited (good for large-context models).
-        """
         cap = self.max_history_messages
         if cap is None or cap <= 0:
             return
@@ -247,9 +297,7 @@ class Agent:
         if len(rest) <= cap:
             return
 
-        # Drop oldest non-system messages; avoid starting mid tool-call block
         rest = rest[-cap:]
-        # If we start with a bare tool result, drop until a user/assistant boundary
         while rest and rest[0].get("role") == "tool":
             rest.pop(0)
 
