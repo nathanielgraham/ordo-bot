@@ -96,7 +96,8 @@ async def run_bot(
         api_key=settings.llm_api_key,
         model=settings.llm_model,
     )
-    agent = Agent(llm)
+    # ordo is attached after login so tools become available
+    agent = Agent(llm, ordo=None)
     log.info("LLM ready: %s @ %s", settings.llm_model, settings.llm_base_url)
 
     # ------------------------------------------------------------------
@@ -136,6 +137,8 @@ async def run_bot(
         await ordo.connect()
         log.info("Connected and logged in to Ordo")
 
+        # Enable Ordo tools now that we are logged in
+        agent.ordo = ordo
         frontend.ordo_connected = True
         await frontend.broadcast_status()
 
