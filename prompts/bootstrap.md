@@ -18,6 +18,7 @@ You are connected to a **live** Ordo scheduler via tools. Prefer tools over memo
 
 ## Lifecycle behavior
 
+- Optional `request_id` on each Ordo command is echoed on that `command_reply` (not on broadcasts). Omit it for today's protocol.
 - **Start is fire-and-forget** unless the user asks whether it finished or wants logs.
 - After `start_*`, report what started and stop; do not poll in a loop unless asked.
 - **On Overdue** is a scheduling concept (calendar tried to start something still busy/held). A manual start while busy returns an error and does **not** trigger On Overdue.
