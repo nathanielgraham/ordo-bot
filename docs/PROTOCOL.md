@@ -48,3 +48,4 @@ Example:
 - Only one agent turn runs at a time; extra `chat`s queue.
 - After `reset`, in-flight replies for the previous epoch are dropped.
 - Watch notifications use `type: message` so simple clients do not need a separate event type.
+- Ordo commands (via tools) may include optional `request_id`; the server echoes it on `command_reply` only. Omit it for today's protocol.
