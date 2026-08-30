@@ -15,7 +15,9 @@ from ordo_bot.ordo_client import OrdoClient
 from ordo_bot.tools import (
     DEFAULT_TOOL_RESULT_MAX_CHARS,
     LOCAL_TOOL_NAMES,
+    canonical_tool_name,
     run_tool,
+    tool_inventory,
     tools_for_turn,
     user_wants_write,
 )
@@ -23,7 +25,7 @@ from ordo_bot.watches import WatchRegistry
 
 log = logging.getLogger("ordo_bot.agent")
 
-DEFAULT_SYSTEM_PROMPT = """\\
+DEFAULT_SYSTEM_PROMPT = """\
 You are ordo-bot, an assistant for the Ordo job scheduler.
 You use tools against a live Ordo instance. Prefer compact summaries.
 Do not invent ids or states.
@@ -31,6 +33,7 @@ Do not invent ids or states.
 Start vs done:
 - start_cluster / start_job success is an ACK, not completion.
 - Do not treat command_reply as \"finished.\"
+- command_reply is not a tool.
 
 Broadcast watches (WebSocket only — never poll):
 - After start_*, if the user wants to know when work is done, call
@@ -42,6 +45,10 @@ Broadcast watches (WebSocket only — never poll):
   does not finish the cluster (prep != Bork da Cake).
 - Keep the Ordo connection open across multi-step work.
 - Example: watch_cluster(id=18, label=\"Bork da Cake\")
+
+Trees:
+- Use find_cluster (name=/root). Result has index + nested tree.
+- read_cluster does not include child clusters.
 """
 
 MAX_TOOL_ROUNDS = 5
@@ -102,6 +109,7 @@ class Agent:
         self.chat_timeout_sec = chat_timeout_sec
         self._bootstrapped = False
         self._current_client: Any = None
+        self._allow_write = False
         self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
         ]
@@ -182,6 +190,9 @@ class Agent:
         return json.dumps({"error": f"{name} must be run via _run_local_tool_async"})
 
     async def _run_local_tool_async(self, name: str, args: Dict[str, Any]) -> str:
+        if name == "list_tools":
+            return json.dumps(tool_inventory(allow_write=self._allow_write))
+
         if name == "watch_event":
             event = str(args.get("event") or "*").strip()
             filt = args.get("filter") or {}
@@ -302,9 +313,12 @@ class Agent:
                 "watch",
             )
         )
+        self._allow_write = allow_write
         tools = None
         if self.ordo and self.ordo.is_logged_in:
             tools = tools_for_turn(allow_write=allow_write)
+
+        read_names = {t["function"]["name"] for t in tools_for_turn(allow_write=False)}
 
         try:
             for round_num in range(MAX_TOOL_ROUNDS):
@@ -325,7 +339,7 @@ class Agent:
                                 "id": tc.id,
                                 "type": "function",
                                 "function": {
-                                    "name": tc.name,
+                                    "name": canonical_tool_name(tc.name),
                                     "arguments": tc.arguments,
                                 },
                             }
@@ -336,20 +350,14 @@ class Agent:
 
                 for tc in result.tool_calls:
                     args = self._parse_args(tc.arguments)
-                    if tc.name in LOCAL_TOOL_NAMES:
-                        tool_result = await self._run_local_tool_async(tc.name, args)
-                    elif (
-                        not allow_write
-                        and tc.name
-                        not in {
-                            t["function"]["name"]
-                            for t in tools_for_turn(allow_write=False)
-                        }
-                    ):
+                    name = canonical_tool_name(tc.name)
+                    if name in LOCAL_TOOL_NAMES:
+                        tool_result = await self._run_local_tool_async(name, args)
+                    elif not allow_write and name not in read_names:
                         tool_result = json.dumps(
                             {
                                 "error": (
-                                    f"Tool {tc.name} is write-only. "
+                                    f"Tool {name} is write-only. "
                                     "Confirm a change first."
                                 )
                             }
@@ -361,7 +369,7 @@ class Agent:
                     else:
                         tool_result = await run_tool(
                             self.ordo,
-                            tc.name,
+                            name,
                             args,
                             max_chars=self.tool_result_max_chars,
                         )
@@ -375,7 +383,7 @@ class Agent:
                     )
                     log.info(
                         "Tool %s finished (round %d, %d chars)",
-                        tc.name,
+                        name,
                         round_num + 1,
                         len(tool_result),
                     )
@@ -414,4 +422,5 @@ class Agent:
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self._bootstrapped = False
+        self._allow_write = False
         log.info("Conversation history cleared")
