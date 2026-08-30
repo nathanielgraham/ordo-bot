@@ -26,9 +26,9 @@
 │   │       └── watches.py  match live broadcasts → notify    │    │
 │   │                                                         │    │
 │   │  OrdoClient         login_user, send_command, on_msg    │    │
-│   └───────────────────────────┬─────────────────────────────┘    │
+│   └─────────────────────────────────────────────────────────┘    │
 │                               │                                  │
-└───────────────────────────────┼──────────────────────────────────┘
+└───────────────────────────────────────────────────────────────┴──────────────────────────────────┘
                                 │
                                 │  wss://ordoscheduler.com/websocket
                                 │  NDJSON commands + broadcasts
@@ -69,10 +69,11 @@ Write tools are only offered when the user turn looks like a change request (or 
 
 ### Completion notify
 
-1. After start, model calls `watch_job` / `watch_cluster` / `watch_event` with a **filter** (include `jobstate` when the user asked for a specific state).
-2. Ordo later emits `jobs_changed` / `clusters_changed` (etc.).
-3. `WatchRegistry` matches filter → FrontendServer pushes `{type:"message", content:"Notification: …"}` without another user turn.
-4. Watch payloads are **not** stored in LLM history (avoids TPM bloat).
+1. After start, model calls `watch_job` / `watch_cluster`. Default filter is **any terminal** state (`complete` / `failed` / `zombie`). Pass `jobstate` only to require one outcome.
+2. Agent takes one `read_job` / `read_cluster` snapshot. If already matching, the watch completes immediately (no hang).
+3. Otherwise Ordo later emits `jobs_changed` / `clusters_changed`. Only the watched **row** counts: a child job does not finish `watch_cluster`.
+4. `WatchRegistry` matches filter → FrontendServer pushes `{type:"message", content:"Notification: …"}` without another user turn.
+5. Watch payloads are **not** stored in LLM history (avoids TPM bloat).
 
 ## Design choices
 

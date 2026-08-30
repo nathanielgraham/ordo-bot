@@ -1,13 +1,21 @@
 """
 Watches driven by Ordo WebSocket broadcasts.
 
-We only react to *new* broadcast messages (e.g. jobs_changed / job_updated).
-We do not poll Ordo and we do not treat "already complete" as a special case —
-if the model wants completion only, it puts jobstate in the filter.
+We react to *new* broadcast messages (jobs_changed / clusters_changed
+and aliases). watch_job / watch_cluster default to any *terminal*
+state (complete / failed / zombie, or state_id 5) so "tell me when
+it's done" does not fire on starting/running.
+
+An optional jobstate filter narrows that. A one-shot snapshot
+(read_job / read_cluster) is applied by the agent on arm so an
+already-terminal target resolves immediately.
 
 Sugar:
-  watch_job(id)     → event jobs_changed (and aliases), filter {id}
-  watch_cluster(id) → event clusters_changed (and aliases), filter {id}
+  watch_job(id)     → jobs_changed (+ aliases), filter {id} + terminal
+  watch_cluster(id) → clusters_changed (+ aliases), filter {id} + terminal
+
+A child job going terminal does not finish a cluster watch. Only the
+cluster row does.
 """
 
 from __future__ import annotations
@@ -15,9 +23,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 log = logging.getLogger("ordo_bot.watches")
+
+TERMINAL_JOBSTATES = frozenset({"complete", "failed", "zombie"})
+TERMINAL_STATE_IDS = frozenset({5})  # 5 == complete
+FILTER_TERMINAL = "_terminal"
 
 # Broadcast names Ordo may use (and common aliases)
 _EVENT_ALIASES: Dict[str, Set[str]] = {
@@ -43,6 +55,28 @@ _KIND_DEFAULT_EVENT = {
 }
 
 
+def jobstate_of(obj: Dict[str, Any]) -> str:
+    return str(
+        obj.get("jobstate") or obj.get("state") or obj.get("status") or ""
+    ).strip()
+
+
+def is_terminal(obj: Optional[Dict[str, Any]]) -> bool:
+    """True when the row has left live states."""
+    if not obj or not isinstance(obj, dict):
+        return False
+    js = jobstate_of(obj).lower()
+    if js in TERMINAL_JOBSTATES:
+        return True
+    try:
+        sid = obj.get("state_id")
+        if sid is not None and int(sid) in TERMINAL_STATE_IDS:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
 @dataclass
 class Watch:
     event: str  # canonical or "*"
@@ -61,7 +95,6 @@ def _events_match(watch_event: str, incoming: str) -> bool:
     group = _EVENT_ALIASES.get(watch_event)
     if group and incoming in group:
         return True
-    # Incoming might be the alias key
     for _canon, aliases in _EVENT_ALIASES.items():
         if watch_event in aliases and incoming in aliases:
             return True
@@ -69,11 +102,13 @@ def _events_match(watch_event: str, incoming: str) -> bool:
 
 
 def _field_match(obj: Dict[str, Any], key: str, expected: Any) -> bool:
+    if key == FILTER_TERMINAL:
+        return bool(expected) and is_terminal(obj)
+
     actual = obj.get(key)
 
     if key in ("jobstate", "state", "status"):
-        # Prefer jobstate, fall back
-        actual = obj.get("jobstate") or obj.get("state") or obj.get("status")
+        actual = jobstate_of(obj)
         if isinstance(expected, list):
             return str(actual or "").lower() in {str(x).lower() for x in expected}
         return str(actual or "").lower() == str(expected).lower()
@@ -102,6 +137,19 @@ def _object_matches(obj: Dict[str, Any], filt: Dict[str, Any]) -> bool:
         if not _field_match(obj, key, expected):
             return False
     return True
+
+
+def _notify_text(event: str, obj: Dict[str, Any], watch: Watch) -> str:
+    name = str(obj.get("name") or "")
+    state = jobstate_of(obj)
+    uid = obj.get("id", "")
+    label = watch.label or name or str(uid)
+    return (
+        f"Notification: **{label}**"
+        + (f" (id {uid})" if uid != "" else "")
+        + (f" → **{state}**" if state else "")
+        + f" [{event}]"
+    )
 
 
 class WatchRegistry:
@@ -137,13 +185,19 @@ class WatchRegistry:
         return {
             "ok": True,
             "event": event,
-            "filter": filt,
+            "filter": {k: v for k, v in filt.items() if not str(k).startswith("_")},
+            "terminal_default": bool(filt.get(FILTER_TERMINAL)),
             "label": label,
             "once": once,
             "message": (
                 f"Watching broadcasts event={event} filter={filt}. "
-                "Notification will fire when a matching Ordo broadcast arrives "
-                "(not by polling current state)."
+                "Fires on a matching Ordo broadcast (not by polling). "
+                + (
+                    "Default match is any terminal jobstate "
+                    "(complete/failed/zombie)."
+                    if filt.get(FILTER_TERMINAL)
+                    else ""
+                )
             ),
         }
 
@@ -159,14 +213,17 @@ class WatchRegistry:
         """
         Sugar: watch job/cluster id on the usual update broadcasts.
 
-        Does *not* imply terminal state. Pass jobstate="complete" if that is
-        what the user asked for.
+        If jobstate is omitted, match any terminal state. Pass
+        jobstate="complete" (etc.) to require one outcome.
         """
         kind = kind if kind in {"cluster", "job"} else "cluster"
         event = _KIND_DEFAULT_EVENT[kind]
         filt: Dict[str, Any] = {"id": int(id)}
-        if jobstate is not None:
+        js = str(jobstate).strip() if jobstate is not None else ""
+        if js:
             filt["jobstate"] = jobstate
+        else:
+            filt[FILTER_TERMINAL] = True
         return self.add_event(
             event=event,
             filter=filt,
@@ -185,6 +242,14 @@ class WatchRegistry:
         self._watches.clear()
         return n
 
+    def match_snapshot(
+        self, obj: Dict[str, Any], *, event: str = "snapshot"
+    ) -> List[Dict[str, Any]]:
+        """Apply a read_* row against armed watches (already-terminal)."""
+        if not obj or not isinstance(obj, dict):
+            return []
+        return self._match_updates(event, [obj], require_event=False)
+
     def match_broadcast(self, event: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Only called when a broadcast is received — never polls."""
         if not self._watches:
@@ -195,12 +260,20 @@ class WatchRegistry:
             updates = []
         if not updates and data.get("id") is not None:
             updates = [data]
+        return self._match_updates(event, updates, require_event=True)
 
+    def _match_updates(
+        self,
+        event: str,
+        updates: List[Any],
+        *,
+        require_event: bool,
+    ) -> List[Dict[str, Any]]:
         fired: List[Dict[str, Any]] = []
         remaining: List[Watch] = []
 
         for w in self._watches:
-            if not _events_match(w.event, event):
+            if require_event and not _events_match(w.event, event):
                 remaining.append(w)
                 continue
 
@@ -214,27 +287,20 @@ class WatchRegistry:
                 remaining.append(w)
                 continue
 
-            name = str(matched_obj.get("name") or "")
-            state = str(
-                matched_obj.get("jobstate")
-                or matched_obj.get("state")
-                or matched_obj.get("status")
-                or ""
+            text = _notify_text(event, matched_obj, w)
+            fired.append(
+                {
+                    "client": w.client,
+                    "text": text,
+                    "watch": w,
+                    "object": matched_obj,
+                }
             )
-            uid = matched_obj.get("id", "")
-            label = w.label or name or str(uid)
-            text = (
-                f"Notification: **{label}**"
-                + (f" (id {uid})" if uid != "" else "")
-                + (f" → **{state}**" if state else "")
-                + f" [{event}]"
-            )
-            fired.append({"client": w.client, "text": text, "watch": w})
             log.info(
-                "Watch fired on broadcast %s filter=%s state=%s",
+                "Watch fired on %s filter=%s state=%s",
                 event,
                 w.filter,
-                state,
+                jobstate_of(matched_obj),
             )
             if not w.once:
                 remaining.append(w)

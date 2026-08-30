@@ -44,9 +44,9 @@ _NAME = {
 _WATCH_JOBSTATE = {
     "type": "string",
     "description": (
-        "REQUIRED when the user cares about a specific state (e.g. complete). "
-        "Matched against jobstate on the broadcast update. "
-        "Omit only if any update for this id should notify."
+        "Optional. If omitted, the watch matches any terminal jobstate "
+        "(complete, failed, zombie). Pass a specific value only to require "
+        "that one outcome."
     ),
 }
 
@@ -79,8 +79,8 @@ READ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _fn(
         "watch_event",
         "Subscribe to Ordo WebSocket broadcasts. Fires only when a matching "
-        "broadcast arrives (never polls). Always put the narrowest filter you can: "
-        "id and jobstate when the user asks for a specific outcome (e.g. complete).",
+        "broadcast arrives (never polls). Prefer watch_job / watch_cluster for "
+        "completion. Use this for custom event+filter pairs.",
         {
             "event": {
                 "type": "string",
@@ -103,9 +103,10 @@ READ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     ),
     _fn(
         "watch_cluster",
-        "Watch Ordo cluster_* / clusters_changed broadcasts for one cluster id. "
-        "When the user says 'when it completes', you MUST pass jobstate='complete' "
-        "or the first intermediate update (e.g. ready/running) will notify instead.",
+        "Watch clusters_changed for one cluster id until that CLUSTER row is "
+        "terminal (complete/failed/zombie). start_* success is not done. A child "
+        "job completing does not finish this watch. Pass jobstate only to require "
+        "one outcome.",
         {
             "id": _ID,
             "jobstate": _WATCH_JOBSTATE,
@@ -115,9 +116,9 @@ READ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     ),
     _fn(
         "watch_job",
-        "Watch Ordo job_updated / jobs_changed broadcasts for one job id. "
-        "When the user says 'when it completes', you MUST pass jobstate='complete' "
-        "or the first intermediate update (e.g. running) will notify instead.",
+        "Watch jobs_changed for one job id until that job is terminal "
+        "(complete/failed/zombie). start_* success is not done. Pass jobstate "
+        "only to require one outcome.",
         {
             "id": _ID,
             "jobstate": _WATCH_JOBSTATE,

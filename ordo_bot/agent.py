@@ -28,14 +28,19 @@ You are ordo-bot, an assistant for the Ordo job scheduler.
 You use tools against a live Ordo instance. Prefer compact summaries.
 Do not invent ids or states.
 
+Start vs done:
+- start_cluster / start_job success is an ACK, not completion.
+- Do not treat command_reply as \"finished.\"
+
 Broadcast watches (WebSocket only — never poll):
-- After start_cluster / start_job, if the user wants to know when something
-  reaches a state, call watch_job or watch_cluster (or watch_event).
-- ALWAYS include jobstate in the watch when the user names a state
-  (e.g. jobstate=\"complete\"). A watch with only id fires on the first
-  matching broadcast (often running/ready), which is usually wrong for
-  \"notify when complete\".
-- Example: watch_job(id=13, jobstate=\"complete\", label=\"sleep-b\")
+- After start_*, if the user wants to know when work is done, call
+  watch_cluster (cluster id) or watch_job (job id).
+- Default watch matches ANY terminal state: complete, failed, zombie
+  (state_id 5 also counts as complete). Pass jobstate only to require
+  one outcome (e.g. jobstate=\"complete\").
+- watch_cluster waits for the CLUSTER row. A child job going complete
+  does not finish the cluster (prep != Bork da Cake).
+- Example: watch_cluster(id=18, label=\"Bork da Cake\")
 """
 
 MAX_TOOL_ROUNDS = 5
@@ -173,6 +178,9 @@ class Agent:
             self._current_client = None
 
     def _run_local_tool(self, name: str, args: Dict[str, Any]) -> str:
+        return json.dumps({"error": f"{name} must be run via _run_local_tool_async"})
+
+    async def _run_local_tool_async(self, name: str, args: Dict[str, Any]) -> str:
         if name == "watch_event":
             event = str(args.get("event") or "*").strip()
             filt = args.get("filter") or {}
@@ -206,9 +214,59 @@ class Agent:
                 client=self._current_client,
                 jobstate=args.get("jobstate"),
             )
+            result = await self._snapshot_watch(kind, oid, result)
             return json.dumps(result)
 
         return json.dumps({"error": f"Unknown local tool: {name}"})
+
+    async def _snapshot_watch(
+        self, kind: str, oid: int, result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Resolve immediately if the target is already in the watched state."""
+        if not self.ordo or not self.ordo.is_logged_in:
+            return result
+        try:
+            if kind == "cluster":
+                data = await self.ordo.read_cluster(oid)
+            else:
+                data = await self.ordo.read_job(oid)
+        except Exception as e:
+            log.warning("Watch snapshot %s %s failed: %s", kind, oid, e)
+            result["snapshot_error"] = str(e)
+            return result
+
+        if not isinstance(data, dict):
+            return result
+        fired = self.watches.match_snapshot(data)
+        if not fired:
+            result["snapshot"] = {
+                "id": data.get("id"),
+                "name": data.get("name"),
+                "jobstate": data.get("jobstate"),
+                "state_id": data.get("state_id"),
+                "matched": False,
+            }
+            return result
+
+        obj = fired[0].get("object") or data
+        result["already_terminal"] = True
+        result["source"] = "snapshot"
+        result["snapshot"] = {
+            "id": obj.get("id"),
+            "name": obj.get("name"),
+            "jobstate": obj.get("jobstate"),
+            "state_id": obj.get("state_id"),
+            "started": obj.get("started"),
+            "ended": obj.get("ended"),
+            "exit_code": obj.get("exit_code"),
+            "matched": True,
+        }
+        result["message"] = (
+            f"{kind} {oid} already "
+            f"{obj.get('jobstate') or 'terminal'}; "
+            "watch completed from snapshot (no broadcast wait)."
+        )
+        return result
 
     def _finalize_from_tools(self) -> str:
         chunks: List[str] = []
@@ -281,7 +339,7 @@ class Agent:
                 for tc in result.tool_calls:
                     args = self._parse_args(tc.arguments)
                     if tc.name in LOCAL_TOOL_NAMES:
-                        tool_result = self._run_local_tool(tc.name, args)
+                        tool_result = await self._run_local_tool_async(tc.name, args)
                     elif (
                         not allow_write
                         and tc.name
