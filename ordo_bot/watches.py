@@ -1,21 +1,11 @@
 """
 Watches driven by Ordo WebSocket broadcasts.
 
-We react to *new* broadcast messages (jobs_changed / clusters_changed
-and aliases). watch_job / watch_cluster default to any *terminal*
-state (complete / failed / zombie, or state_id 5) so "tell me when
-it's done" does not fire on starting/running.
+Terminal detection comes from ordo-wsagent (jobstate names only:
+complete / failed / zombie / killed). state_id is ignored.
 
-An optional jobstate filter narrows that. A one-shot snapshot
-(read_job / read_cluster) is applied by the agent on arm so an
-already-terminal target resolves immediately.
-
-Sugar:
-  watch_job(id)     → jobs_changed (+ aliases), filter {id} + terminal
-  watch_cluster(id) → clusters_changed (+ aliases), filter {id} + terminal
-
-A child job going terminal does not finish a cluster watch. Only the
-cluster row does.
+Bot-specific: per-frontend-client targeting and notification text.
+The async Ordo socket stays in ordo_bot.ordo_client.
 """
 
 from __future__ import annotations
@@ -25,13 +15,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
+from ordo_wsagent import TERMINAL_JOBSTATES
+from ordo_wsagent import is_terminal as lib_is_terminal
+from ordo_wsagent import jobstate_of as lib_jobstate_of
+
 log = logging.getLogger("ordo_bot.watches")
 
-TERMINAL_JOBSTATES = frozenset({"complete", "failed", "zombie"})
-TERMINAL_STATE_IDS = frozenset({5})  # 5 == complete
 FILTER_TERMINAL = "_terminal"
 
-# Broadcast names Ordo may use (and common aliases)
 _EVENT_ALIASES: Dict[str, Set[str]] = {
     "jobs_changed": {"jobs_changed", "job_changed", "job_updated", "jobs_updated"},
     "job_updated": {"jobs_changed", "job_changed", "job_updated", "jobs_updated"},
@@ -55,31 +46,25 @@ _KIND_DEFAULT_EVENT = {
 }
 
 
-def jobstate_of(obj: Dict[str, Any]) -> str:
-    return str(
-        obj.get("jobstate") or obj.get("state") or obj.get("status") or ""
-    ).strip()
+def jobstate_of(obj: Optional[Dict[str, Any]]) -> str:
+    js = lib_jobstate_of(obj)
+    if js:
+        return js
+    if not obj or not isinstance(obj, dict):
+        return ""
+    return str(obj.get("state") or obj.get("status") or "").strip().lower()
 
 
 def is_terminal(obj: Optional[Dict[str, Any]]) -> bool:
-    """True when the row has left live states."""
+    """True when jobstate is complete, failed, zombie, or killed."""
     if not obj or not isinstance(obj, dict):
         return False
-    js = jobstate_of(obj).lower()
-    if js in TERMINAL_JOBSTATES:
-        return True
-    try:
-        sid = obj.get("state_id")
-        if sid is not None and int(sid) in TERMINAL_STATE_IDS:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return False
+    return lib_is_terminal({"jobstate": jobstate_of(obj)})
 
 
 @dataclass
 class Watch:
-    event: str  # canonical or "*"
+    event: str
     filter: Dict[str, Any] = field(default_factory=dict)
     label: str = ""
     once: bool = True
@@ -194,7 +179,7 @@ class WatchRegistry:
                 "Fires on a matching Ordo broadcast (not by polling). "
                 + (
                     "Default match is any terminal jobstate "
-                    "(complete/failed/zombie)."
+                    "(complete/failed/zombie/killed)."
                     if filt.get(FILTER_TERMINAL)
                     else ""
                 )
@@ -210,12 +195,6 @@ class WatchRegistry:
         client: Any = None,
         jobstate: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """
-        Sugar: watch job/cluster id on the usual update broadcasts.
-
-        If jobstate is omitted, match any terminal state. Pass
-        jobstate="complete" (etc.) to require one outcome.
-        """
         kind = kind if kind in {"cluster", "job"} else "cluster"
         event = _KIND_DEFAULT_EVENT[kind]
         filt: Dict[str, Any] = {"id": int(id)}
@@ -245,16 +224,13 @@ class WatchRegistry:
     def match_snapshot(
         self, obj: Dict[str, Any], *, event: str = "snapshot"
     ) -> List[Dict[str, Any]]:
-        """Apply a read_* row against armed watches (already-terminal)."""
         if not obj or not isinstance(obj, dict):
             return []
         return self._match_updates(event, [obj], require_event=False)
 
     def match_broadcast(self, event: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Only called when a broadcast is received — never polls."""
         if not self._watches:
             return []
-
         updates = data.get("updates") or []
         if not isinstance(updates, list):
             updates = []
