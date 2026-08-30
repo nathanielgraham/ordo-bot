@@ -23,7 +23,7 @@ from ordo_bot.watches import WatchRegistry
 
 log = logging.getLogger("ordo_bot.agent")
 
-DEFAULT_SYSTEM_PROMPT = """\
+DEFAULT_SYSTEM_PROMPT = """\\
 You are ordo-bot, an assistant for the Ordo job scheduler.
 You use tools against a live Ordo instance. Prefer compact summaries.
 Do not invent ids or states.
@@ -35,11 +35,12 @@ Start vs done:
 Broadcast watches (WebSocket only — never poll):
 - After start_*, if the user wants to know when work is done, call
   watch_cluster (cluster id) or watch_job (job id).
-- Default watch matches ANY terminal state: complete, failed, zombie
-  (state_id 5 also counts as complete). Pass jobstate only to require
-  one outcome (e.g. jobstate=\"complete\").
+- Default watch matches ANY terminal jobstate: complete, failed, zombie, killed.
+  Do not use state_id. Pass jobstate only to require one outcome
+  (e.g. jobstate=\"complete\").
 - watch_cluster waits for the CLUSTER row. A child job going complete
   does not finish the cluster (prep != Bork da Cake).
+- Keep the Ordo connection open across multi-step work.
 - Example: watch_cluster(id=18, label=\"Bork da Cake\")
 """
 
@@ -222,7 +223,6 @@ class Agent:
     async def _snapshot_watch(
         self, kind: str, oid: int, result: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Resolve immediately if the target is already in the watched state."""
         if not self.ordo or not self.ordo.is_logged_in:
             return result
         try:
@@ -243,7 +243,6 @@ class Agent:
                 "id": data.get("id"),
                 "name": data.get("name"),
                 "jobstate": data.get("jobstate"),
-                "state_id": data.get("state_id"),
                 "matched": False,
             }
             return result
@@ -255,7 +254,6 @@ class Agent:
             "id": obj.get("id"),
             "name": obj.get("name"),
             "jobstate": obj.get("jobstate"),
-            "state_id": obj.get("state_id"),
             "started": obj.get("started"),
             "ended": obj.get("ended"),
             "exit_code": obj.get("exit_code"),
