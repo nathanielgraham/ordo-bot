@@ -1,5 +1,5 @@
 from ordo_bot.llm import recover_tool_calls_from_exception, recover_tool_calls_from_text
-from ordo_bot.tools import canonical_tool_name, _normalize_args
+from ordo_bot.tools import canonical_tool_name, _normalize_args, tool_inventory
 
 
 def test_canonical_strips_mcp_prefix_and_aliases():
@@ -46,3 +46,14 @@ def test_recover_from_plain_text_blob():
     )
     assert calls[0].name == "ordo.list_jobs"
     assert canonical_tool_name(calls[0].name) == "find_cluster"
+
+
+def test_tool_inventory_has_reads_not_command_reply():
+    inv = tool_inventory(allow_write=False)
+    assert "find_cluster" in inv["read"]
+    assert "list_tools" in inv["read"]
+    assert "list_jobs" in inv["read"]
+    assert inv["write"] == []
+    assert "command_reply" in inv["not_tools"]
+    inv_w = tool_inventory(allow_write=True)
+    assert "start_cluster" in inv_w["write"]

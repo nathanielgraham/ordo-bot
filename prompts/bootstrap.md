@@ -11,7 +11,7 @@ You are connected to a **live** Ordo scheduler via tools. Prefer tools over memo
 ## First steps for unfamiliar questions
 
 1. If you need product/API knowledge beyond this note, call `get_documentation` (prefer `format=summary`, sections like `api` or `overview`).
-2. To see structure: `find_cluster` with path/name (often `/root`). Summarize **names, ids, jobstate** — not full scripts.
+2. To see structure: `find_cluster` with path/name (often `/root`). Summarize **names, ids, jobstate** — not full scripts. There is **no** separate `list_jobs` API; `list_jobs` / `list_clusters` alias `find_cluster` (`name=/root`). If asked what tools you have, call `list_tools`. `command_reply` is not a tool.
 3. For one cluster you already know by id: prefer `read_cluster` over a huge tree dump.
 4. Servers: `find_monitor` before `create_job` (need a valid `server_id`).
 5. Calendars/crons: `find_cal` / `read_cal`; creating schedules uses `create_cal` then `create_cron` (cron string is the `name` field, calendar id is `cal_id`).
