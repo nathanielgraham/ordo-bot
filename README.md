@@ -18,7 +18,7 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for a diagram and component
            ▼
       ┌─────────────┐
       │  ordo-bot   │  agent + tools + watches + queue
-      └──────┬──────┘
+      └─────────────┘
              │  wss://…/websocket  (Ordo protocol)
              ▼
          Ordo server
@@ -102,16 +102,18 @@ Environment overrides use the `ORDO_BOT_` prefix (e.g. `ORDO_BOT_ORDO_TOKEN`).
 
 ## Watches (completion / broadcasts)
 
-Ordo pushes `jobs_changed` / `clusters_changed` (and aliases). ordo-bot does **not** poll for completion.
+Ordo pushes `jobs_changed` / `clusters_changed` (and aliases). ordo-bot does **not** poll for completion. `start_*` `command_reply` is an ack, not done.
 
 | Tool | Use |
 |------|-----|
-| `watch_job` | Filter broadcasts for one job id; pass `jobstate="complete"` when you care about that state |
-| `watch_cluster` | Same for a cluster id |
+| `watch_job` | One job id. Default: any terminal state (`complete` / `failed` / `zombie`). Optional `jobstate` to require one outcome. |
+| `watch_cluster` | Same for a **cluster** row. A child job completing does not finish the cluster watch. |
 | `watch_event` | Generic: `event` + `filter` (`id`, `name`, `jobstate`, …) |
 
-Example user request: *“Start concurrent-b and tell me when sleep-b completes.”*  
-The agent should `start_cluster` then `watch_job(id=…, jobstate="complete")`. A later matching broadcast produces a client `message` notification.
+On arm, `watch_job` / `watch_cluster` take one `read_*` snapshot so an already-terminal target resolves immediately.
+
+Example: *“Start Bork da Cake and tell me when it finishes.”*  
+`start_cluster` then `watch_cluster(id=18)`. A later matching broadcast (or the snapshot) produces a client `message` notification.
 
 ## Frontend protocol
 
