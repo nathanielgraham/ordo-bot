@@ -5,6 +5,7 @@ description = "Ordo WebSocket agent bot – connect your own LLM to Ordo"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "ordo-wsagent @ git+https://github.com/nathanielgraham/ordo-wsagent.git",
     "websockets>=12.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
@@ -18,6 +19,7 @@ dependencies = [
 dev = [
     "ruff",
     "mypy",
+    "pytest>=7.0",
 ]
 
 [project.scripts]
