@@ -10,6 +10,7 @@ apply when configured > 0, and never sleep for multi-minute windows.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -23,16 +24,21 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 log = logging.getLogger("ordo_bot.llm")
 
 DEFAULT_LLM_TIMEOUT_SEC = 90.0
-DEFAULT_LLM_RETRIES = 0  # fail fast; user/agent retries
+DEFAULT_LLM_RETRIES = 0
 DEFAULT_LLM_RETRY_BACKOFF_SEC = 1.5
 MAX_RETRY_SLEEP_SEC = 15.0
+
+_FAILED_GEN_RE = re.compile(
+    r"failed_generation['\"]?\s*[:=]\s*['\"](\{.*\})['\"]",
+    re.DOTALL,
+)
 
 
 @dataclass
 class ToolCall:
     id: str
     name: str
-    arguments: str  # JSON string
+    arguments: str
 
 
 @dataclass
@@ -79,6 +85,12 @@ def tool_calls_from_obj(data: Any) -> List[ToolCall]:
     if not isinstance(data, dict):
         return calls
 
+    err = data.get("error")
+    if isinstance(err, dict) and err.get("failed_generation"):
+        calls.extend(recover_tool_calls_from_text(str(err.get("failed_generation"))))
+        if calls:
+            return calls
+
     if "tool_calls" in data and isinstance(data["tool_calls"], list):
         for tc in data["tool_calls"]:
             if not isinstance(tc, dict):
@@ -103,29 +115,63 @@ def tool_calls_from_obj(data: Any) -> List[ToolCall]:
     return calls
 
 
+def _try_parse_obj(text: str) -> Any:
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    try:
+        val = ast.literal_eval(text)
+        if isinstance(val, (dict, list)):
+            return val
+    except (ValueError, SyntaxError):
+        pass
+    return None
+
+
 def _extract_json_blobs(text: str) -> List[Any]:
     blobs: List[Any] = []
     if not text:
         return blobs
-    try:
-        blobs.append(json.loads(text))
-        return blobs
-    except json.JSONDecodeError:
-        pass
 
-    for opener, closer in (("{", "}"), ("[", "]")):
-        start = None
+    parsed = _try_parse_obj(text)
+    if parsed is not None:
+        blobs.append(parsed)
+        return blobs
+
+    for m in _FAILED_GEN_RE.finditer(text):
+        raw = m.group(1)
+        try:
+            unescaped = raw.encode("utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            unescaped = raw
+        inner = _try_parse_obj(unescaped) or _try_parse_obj(raw)
+        if inner is not None:
+            blobs.append(inner)
+
+    dash = text.find(" - ")
+    if dash != -1:
+        tail = _try_parse_obj(text[dash + 3 :])
+        if tail is not None:
+            blobs.append(tail)
+
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] not in "{[" :
+            i += 1
+            continue
+        opener = text[i]
+        closer = "}" if opener == "{" else "]"
         depth = 0
         in_str = False
         esc = False
-        for i, ch in enumerate(text):
-            if start is None:
-                if ch == opener:
-                    start = i
-                    depth = 1
-                    in_str = False
-                    esc = False
-                continue
+        advanced = False
+        for j in range(i, n):
+            ch = text[j]
             if in_str:
                 if esc:
                     esc = False
@@ -140,20 +186,31 @@ def _extract_json_blobs(text: str) -> List[Any]:
                 depth += 1
             elif ch == closer:
                 depth -= 1
-                if depth == 0 and start is not None:
-                    chunk = text[start : i + 1]
-                    try:
-                        blobs.append(json.loads(chunk))
-                    except json.JSONDecodeError:
-                        pass
-                    start = None
+                if depth == 0:
+                    chunk = text[i : j + 1]
+                    obj = _try_parse_obj(chunk)
+                    if obj is not None:
+                        blobs.append(obj)
+                        i = j + 1
+                    else:
+                        i += 1
+                    advanced = True
+                    break
+        if not advanced:
+            i += 1
     return blobs
 
 
 def recover_tool_calls_from_text(text: str) -> List[ToolCall]:
     found: List[ToolCall] = []
+    seen = set()
     for blob in _extract_json_blobs(text):
-        found.extend(tool_calls_from_obj(blob))
+        for call in tool_calls_from_obj(blob):
+            key = (call.name, call.arguments)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(call)
     return found
 
 
@@ -171,6 +228,12 @@ def _error_payload_text(exc: BaseException) -> str:
                 val = err.get(key)
                 if isinstance(val, str):
                     parts.append(val)
+    elif isinstance(body, str):
+        parts.append(body)
+    resp = getattr(exc, "response", None)
+    resp_text = getattr(resp, "text", None) if resp is not None else None
+    if isinstance(resp_text, str):
+        parts.append(resp_text)
     return "\n".join(parts)
 
 
@@ -193,7 +256,6 @@ def _is_daily_or_quota_exhausted(exc: BaseException) -> bool:
 
 
 def _is_retryable(exc: BaseException) -> bool:
-    """Only used when llm_max_retries > 0."""
     if _is_daily_or_quota_exhausted(exc):
         return False
     if isinstance(exc, (APITimeoutError, APIConnectionError, asyncio.TimeoutError)):
@@ -220,7 +282,6 @@ def _retry_after_seconds(exc: BaseException, default: float) -> float:
 
 
 def format_llm_error(exc: BaseException) -> str:
-    """Short user-facing string for LLM failures (shown in chat)."""
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
         err = body.get("error")
@@ -322,8 +383,6 @@ class LLM:
 
             except Exception as e:
                 last_exc = e
-
-                # Still recover tool intent from error payloads (not a "retry")
                 recovered = recover_tool_calls_from_exception(e)
                 if recovered:
                     log.warning(
